@@ -103,7 +103,7 @@ showSrcLabels = input.bool(true, "Label each line with its source day", group=gr
 
 grpSig = "Signals"
 showSignals = input.bool(true, "Show touch-rejection signals", group=grpSig, tooltip="Triangle when a bar comes into a drawn gap level and closes back away from it. Set alerts to fire Once Per Bar Close.")
-reqTrend = input.bool(true, "Require 3-TF HMA alignment", group=grpSig, tooltip="Long: all three trends BULL. Short: all three BEAR. Uses the dashboard's actual values.")
+alignReq = input.string("A (5+15+65)", "Trend alignment required", options=["A (5+15+65)", "B or better (5+15)", "Off"], group=grpSig, tooltip="A setup = 5, 15 AND 65 min trends aligned. B setup = 5 and 15 aligned, 65 disagrees. 'B or better' accepts both grades; triangles are lettered A or B so you can tell them apart. Off = no trend requirement.")
 reqVwap  = input.bool(true, "Require VWAP bias", group=grpSig, tooltip="Long: price above VWAP. Short: below.")
 reqMacd  = input.bool(true, "Require Zero Lag MACD gate", group=grpSig, tooltip="Reversal gate. Long: MACD line BELOW zero and heading up (bearish momentum dying). Short: ABOVE zero and heading down. No crossovers.")
 
@@ -519,6 +519,16 @@ tf5Bear  = close < hma5
 tfBullCount = (tf65Bull ? 1 : 0) + (tf15Bull ? 1 : 0) + (tf5Bull ? 1 : 0)
 tfBearCount = (tf65Bear ? 1 : 0) + (tf15Bear ? 1 : 0) + (tf5Bear ? 1 : 0)
 
+// Setup grades: A = all three timeframes aligned; B = 5 and 15 aligned
+// while the 65 disagrees.
+trendLongA  = tf5Bull and tf15Bull and tf65Bull
+trendLongB  = tf5Bull and tf15Bull and not tf65Bull
+trendShortA = tf5Bear and tf15Bear and tf65Bear
+trendShortB = tf5Bear and tf15Bear and not tf65Bear
+
+gradeTxt = trendLongA ? "A LONG" : trendShortA ? "A SHORT" : trendLongB ? "B LONG" : trendShortB ? "B SHORT" : "—"
+gradeCol = trendLongA or trendLongB ? #00ffbb : trendShortA or trendShortB ? #ff1100 : #888888
+
 // VWAP — "Session" resets at YOUR session anchor, not the broker's daily bar.
 sesNew = sessAnchorOf(time) != sessAnchorOf(nz(time[1], time - 86400000))
 isNew = switch vwapAnchor
@@ -554,11 +564,21 @@ macdSetupCol = macdLine >= 0 ? (macdLine > macdLine[1] ? #cccc00 : #ff1100) : (m
 // Coupons commit on bar close; lines stay on screen until the next session
 // open regardless of how many coupons are spent.
 
-longConf  = (not reqTrend or tfBullCount == 3) and (not reqVwap or vwapBullish)     and (not reqMacd or macdLongGate)
-shortConf = (not reqTrend or tfBearCount == 3) and (not reqVwap or not vwapBullish) and (not reqMacd or macdShortGate)
+// Non-trend confluences (VWAP + Zero Lag MACD gate).
+longBase  = (not reqVwap or vwapBullish)     and (not reqMacd or macdLongGate)
+shortBase = (not reqVwap or not vwapBullish) and (not reqMacd or macdShortGate)
 
-bool rejUp = false
-bool rejDn = false
+// Which grades pass the alignment requirement. A passes everything;
+// B passes "B or better" and Off; ungraded passes only Off.
+allowB    = alignReq != "A (5+15+65)"
+allowNone = alignReq == "Off"
+
+bool rejUpA = false
+bool rejUpB = false
+bool rejUpN = false
+bool rejDnA = false
+bool rejDnB = false
+bool rejDnN = false
 // barstate.isconfirmed: signals and coupons commit only on the bar CLOSE
 // (rule 7) — no mid-bar triangles that appear and then retract.
 if modGaps and barstate.isconfirmed and array.size(azLo) > 0
@@ -568,18 +588,42 @@ if modGaps and barstate.isconfirmed and array.size(azLo) > 0
             zH = array.get(azHi, j)
             hitUp = open > zH and low <= zH and close > zH
             hitDn = open < zL and high >= zL and close < zL
-            if hitUp and longConf
-                rejUp := true
-            if hitDn and shortConf
-                rejDn := true
-            spend = couponMode == "Any rejection" ? (hitUp or hitDn) : ((hitUp and longConf) or (hitDn and shortConf))
+            if hitUp and longBase
+                if trendLongA
+                    rejUpA := true
+                else if trendLongB and allowB
+                    rejUpB := true
+                else if allowNone
+                    rejUpN := true
+            if hitDn and shortBase
+                if trendShortA
+                    rejDnA := true
+                else if trendShortB and allowB
+                    rejDnB := true
+                else if allowNone
+                    rejDnN := true
+            sigUp = hitUp and longBase  and (trendLongA  or (trendLongB  and allowB) or allowNone)
+            sigDn = hitDn and shortBase and (trendShortA or (trendShortB and allowB) or allowNone)
+            spend = couponMode == "Any rejection" ? (hitUp or hitDn) : (sigUp or sigDn)
             if spend
                 array.set(azUses, j, array.get(azUses, j) - 1)
 
-plotshape(showSignals ? rejUp : false, "Gap rejection (long)", shape.triangleup, location.belowbar, color=#00ffbb, size=size.tiny)
-plotshape(showSignals ? rejDn : false, "Gap rejection (short)", shape.triangledown, location.abovebar, color=#ff5030, size=size.tiny)
-alertcondition(rejUp, "Gap rejection LONG", "TSE Suite: bullish rejection at volume gap level (confluence per settings)")
-alertcondition(rejDn, "Gap rejection SHORT", "TSE Suite: bearish rejection at volume gap level (confluence per settings)")
+rejUpAny = rejUpA or rejUpB or rejUpN
+rejDnAny = rejDnA or rejDnB or rejDnN
+
+plotshape(showSignals ? rejUpA : false, "Gap rejection A (long)", shape.triangleup, location.belowbar, color=#00ffbb, text="A", textcolor=#00ffbb, size=size.tiny)
+plotshape(showSignals ? rejUpB : false, "Gap rejection B (long)", shape.triangleup, location.belowbar, color=#ffcc00, text="B", textcolor=#ffcc00, size=size.tiny)
+plotshape(showSignals ? rejUpN : false, "Gap rejection (long, ungraded)", shape.triangleup, location.belowbar, color=#00ffbb, size=size.tiny)
+plotshape(showSignals ? rejDnA : false, "Gap rejection A (short)", shape.triangledown, location.abovebar, color=#ff5030, text="A", textcolor=#ff5030, size=size.tiny)
+plotshape(showSignals ? rejDnB : false, "Gap rejection B (short)", shape.triangledown, location.abovebar, color=#ffcc00, text="B", textcolor=#ffcc00, size=size.tiny)
+plotshape(showSignals ? rejDnN : false, "Gap rejection (short, ungraded)", shape.triangledown, location.abovebar, color=#ff5030, size=size.tiny)
+
+alertcondition(rejUpAny, "Gap rejection LONG", "TSE Suite: bullish rejection at volume gap level (confluence per settings)")
+alertcondition(rejDnAny, "Gap rejection SHORT", "TSE Suite: bearish rejection at volume gap level (confluence per settings)")
+alertcondition(rejUpA, "Gap rejection LONG — A setup", "TSE Suite: A-setup bullish rejection (5+15+65 aligned)")
+alertcondition(rejUpB, "Gap rejection LONG — B setup", "TSE Suite: B-setup bullish rejection (5+15 aligned, 65 against)")
+alertcondition(rejDnA, "Gap rejection SHORT — A setup", "TSE Suite: A-setup bearish rejection (5+15+65 aligned)")
+alertcondition(rejDnB, "Gap rejection SHORT — B setup", "TSE Suite: B-setup bearish rejection (5+15 aligned, 65 against)")
 
 // ─── DASHBOARD BOX ───────────────────────────────────────────────────────────
 
@@ -595,7 +639,7 @@ if barstate.islast and not modDash and not na(tbl)
     tbl := na
 if barstate.islast and modDash
     if na(tbl)
-        tbl := table.new(posFromInput(tblPos), 2, 8, bgcolor=color.new(#1a1a2e, 10), border_width=1, border_color=#333355, frame_color=#444477, frame_width=1)
+        tbl := table.new(posFromInput(tblPos), 2, 9, bgcolor=color.new(#1a1a2e, 10), border_width=1, border_color=#333355, frame_color=#444477, frame_width=1)
     table.cell(tbl, 0, 0, "TREND DASHBOARD", text_color=#8888cc, text_size=sz)
     table.cell(tbl, 1, 0, "", text_color=#8888cc, text_size=sz)
     table.cell(tbl, 0, 1, "65min Trend", text_color=cLbl, text_size=sz)
@@ -606,6 +650,8 @@ if barstate.islast and modDash
     table.cell(tbl, 1, 3, tf5Bull ? "BULL" : tf5Bear ? "BEAR" : "NEUTRAL", text_color=tf5Bull ? cBull : tf5Bear ? cBear : cNeut, text_size=sz, text_halign=text.align_center)
     table.cell(tbl, 0, 4, "Bias Aligned", text_color=cLbl, text_size=sz)
     table.cell(tbl, 1, 4, str.tostring(tfBullCount) + "B / " + str.tostring(tfBearCount) + "S", text_color=tfBullCount >= 3 ? cBull : tfBearCount >= 3 ? cBear : #cccc00, text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 0, 8, "Setup Grade", text_color=cLbl, text_size=sz)
+    table.cell(tbl, 1, 8, gradeTxt, text_color=gradeCol, text_size=sz, text_halign=text.align_center)
     table.cell(tbl, 0, 5, "VWAP Bias", text_color=cLbl, text_size=sz)
     table.cell(tbl, 1, 5, vwapBullish ? "ABOVE" : "BELOW", text_color=vwapBullish ? cBull : cBear, text_size=sz, text_halign=text.align_center)
     table.cell(tbl, 0, 6, "MACD Gate", text_color=cLbl, text_size=sz)
