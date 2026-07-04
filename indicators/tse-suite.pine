@@ -3,9 +3,10 @@
 // TSE SUITE — VP Gap Reversal toolkit (Bitcoin + US30 in one indicator)
 // -------------------------------------------------------------------------
 // Market preset switch: both presets anchor at the Tokyo open; the trend is
-// a 5-DAY Hull MA per timeframe — Bitcoin's 24h day gives 1440/480/111,
-// US30 uses 390/130/30. Manual frees the Session Anchor and HMA inputs.
-// All gap detection and cleanliness settings are %-based and market-neutral.
+// a 5-calendar-day Hull MA per timeframe over all traded hours — Bitcoin
+// 1440/480/111, US30 1380/460/106. Manual frees the Session Anchor and HMA
+// inputs. All gap detection and cleanliness settings are %-based and
+// market-neutral.
 // -------------------------------------------------------------------------
 // Combines the three standalone tools into ONE indicator sharing ONE profile
 // engine, so the histogram you look at and the gap lines you trade are built
@@ -48,16 +49,18 @@ modDash = input.bool(true, "Trend Dashboard", group=grpMod)
 // One indicator for both markets. The preset sets the session anchor and the
 // HMA trend calibration; everything else (gap thresholds, distance filter,
 // coupons) is percentage-based and works identically on any symbol.
-//   The HMA periods represent a 5-DAY Hull moving average on each timeframe.
-//   Equity hours (6.5h/day): 78×5=390 five-min, 26×5=130 fifteen-min,
-//   6×5=30 sixty-five-min. Bitcoin trades 24h/day: 288×5=1440 five-min,
-//   96×5=480 fifteen-min, ~22×5=111 sixty-five-min.
-//   Bitcoin: Tokyo-open anchor; 5-day HMAs sized to the 24h day (1440/480/111).
-//   US30:    Tokyo-open anchor; 5-day HMAs 390/130/30 (equity-hours sizing).
+//   The HMA periods represent a 5-CALENDAR-DAY Hull moving average on each
+//   timeframe, counting all traded hours. Bitcoin (24h/day): 288×5=1440
+//   five-min, 96×5=480 fifteen-min, ~22×5=111 sixty-five-min. US30 CFD
+//   (~23h/day): 276×5=1380 five-min, 92×5=460 fifteen-min, ~21×5=106
+//   sixty-five-min. (Shannon's original 390/130/30 are 5 days of 6.5h
+//   equity-session bars — use Manual to run those literal numbers.)
+//   Bitcoin: Tokyo-open anchor; 5-day HMAs 1440/480/111.
+//   US30:    Tokyo-open anchor; 5-day HMAs 1380/460/106.
 //   Manual:  use the Session Anchor and HMA Trend inputs below as-is.
 
 grpMkt = "Market"
-mktPreset = input.string("Bitcoin", "Market preset", options=["Bitcoin", "US30", "Manual"], group=grpMkt, tooltip="Both presets anchor sessions at the Tokyo open (9:00 Asia/Tokyo). The HMA trend is a 5-DAY Hull MA: Bitcoin's 24h day gives 1440/480/111; US30 uses 390/130/30. Manual = use the Session Anchor and HMA inputs below.")
+mktPreset = input.string("Bitcoin", "Market preset", options=["Bitcoin", "US30", "Manual"], group=grpMkt, tooltip="Both presets anchor sessions at the Tokyo open (9:00 Asia/Tokyo). The HMA trend is a 5-calendar-day Hull MA over all traded hours: Bitcoin 1440/480/111, US30 1380/460/106. Manual = use the Session Anchor and HMA inputs below (e.g. Shannon's literal 390/130/30).")
 presetBTC = mktPreset == "Bitcoin"
 presetUS  = mktPreset == "US30"
 
@@ -140,12 +143,12 @@ hma5LenIn  = input.int(390, "5-min HMA Period",  minval=2, group=grpHMA, tooltip
 hma15LenIn = input.int(130, "15-min HMA Period", minval=2, group=grpHMA, tooltip="Used only when Market preset = Manual. 5-day HMA: 130 = 5 equity days of 15-min bars (26/day). A 24h market's 5-day = 480.")
 hma65LenIn = input.int(30,  "65-min HMA Period", minval=2, group=grpHMA, tooltip="Used only when Market preset = Manual. 5-day HMA: 30 = 5 equity days of 65-min bars (6/day). A 24h market's 5-day ≈ 111.")
 
-// Preset calibration: the trend is a 5-DAY Hull MA on every timeframe.
-// Bitcoin trades 24h/day: 5 days = 1440 five-min bars, 480 fifteen-min
-// bars, ~111 sixty-five-min bars.
-hma5Len  = presetBTC ? 1440 : presetUS ? 390 : hma5LenIn
-hma15Len = presetBTC ? 480  : presetUS ? 130 : hma15LenIn
-hma65Len = presetBTC ? 111  : presetUS ? 30  : hma65LenIn
+// Preset calibration: the trend is a 5-calendar-day Hull MA on every
+// timeframe, counting all traded hours. Bitcoin 24h/day → 1440/480/111.
+// US30 CFD ~23h/day → 1380/460/106.
+hma5Len  = presetBTC ? 1440 : presetUS ? 1380 : hma5LenIn
+hma15Len = presetBTC ? 480  : presetUS ? 460  : hma15LenIn
+hma65Len = presetBTC ? 111  : presetUS ? 106  : hma65LenIn
 
 grpMACD = "Zero Lag MACD (HMA)"
 macdFast = input.int(12, "Fast HMA period", minval=1, group=grpMACD)
