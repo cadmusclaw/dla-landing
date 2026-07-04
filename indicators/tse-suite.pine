@@ -21,8 +21,10 @@
 //    daily bar boundary) — used for both the VWAP line and the dashboard bias.
 //  • Walk-back day-selection guarded (Pine for-loops count down when
 //    start > end), with the non-24/7 fallback for gap opens.
-//  • Touch-rejection signals can be gated by the dashboard's REAL confluence
-//    values (3-TF HMA alignment, VWAP bias, optional MACD zero-line).
+//  • Touch-rejection signals are gated by the dashboard's REAL confluence
+//    values: 3-TF HMA alignment, VWAP bias, and the Zero Lag MACD reversal
+//    gate (long = MACD below zero heading up; short = above zero heading
+//    down; no crossovers).
 // ═════════════════════════════════════════════════════════════════════════════
 indicator("TSE Suite — VP Gaps + Trend", shorttitle="TSE Suite", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=200)
 
@@ -86,7 +88,7 @@ grpSig = "Signals"
 showSignals = input.bool(true, "Show touch-rejection signals", group=grpSig, tooltip="Triangle when a bar comes into a drawn gap zone and closes back away from it. Set alerts to fire Once Per Bar Close.")
 reqTrend = input.bool(true, "Require 3-TF HMA alignment", group=grpSig, tooltip="Long: all three trends BULL. Short: all three BEAR. Uses the dashboard's actual values.")
 reqVwap  = input.bool(true, "Require VWAP bias", group=grpSig, tooltip="Long: price above VWAP. Short: below.")
-reqMacd  = input.bool(false, "Require MACD zero-line agreement", group=grpSig, tooltip="Long: MACD line at/above 0. Short: at/below 0. Left OFF by default — if your zero-line rule is different, say so and it gets wired your way.")
+reqMacd  = input.bool(true, "Require Zero Lag MACD gate", group=grpSig, tooltip="Reversal gate. Long: MACD line BELOW zero and heading up (bearish momentum dying). Short: ABOVE zero and heading down. No crossovers.")
 
 grpDbg = "Status Box"
 showStatus = input.bool(true, "Show status box", group=grpDbg)
@@ -99,10 +101,10 @@ hma5Len  = input.int(390, "5-min HMA Period",  minval=2, group=grpHMA, tooltip="
 hma15Len = input.int(130, "15-min HMA Period", minval=2, group=grpHMA, tooltip="130 = one 15-min trading day.")
 hma65Len = input.int(30,  "65-min HMA Period", minval=2, group=grpHMA, tooltip="30 ≈ two 65-min trading days.")
 
-grpMACD = "HMA-MACD"
-macdFast = input.int(12, "MACD Fast", minval=1, group=grpMACD)
-macdSlow = input.int(24, "MACD Slow", minval=1, group=grpMACD)
-macdSig  = input.int(11, "MACD Signal", minval=1, group=grpMACD)
+grpMACD = "Zero Lag MACD (HMA)"
+macdFast = input.int(12, "Fast HMA period", minval=1, group=grpMACD)
+macdSlow = input.int(24, "Slow HMA period", minval=1, group=grpMACD)
+macdSig  = input.int(11, "Signal HMA period", minval=1, group=grpMACD, tooltip="Signal line is informational only — the trade gate uses the MACD line's position vs zero and its direction, not crossovers.")
 
 grpVWAP = "VWAP"
 vwapAnchor = input.string("Session", "VWAP Anchor", options=["Session", "Week", "Month"], group=grpVWAP, tooltip="Session = resets at your session start hour above (18:00), not the broker's daily bar.")
@@ -470,21 +472,17 @@ isNew = switch vwapAnchor
 vwapBullish = close > _vwap
 plot(showVWAP ? _vwap : na, "VWAP", color.new(#00dddd, 30), 2)
 
+// Zero Lag MACD (HMA-based, same construction as the standalone script).
+// The gate is zero-line + direction — NO crossovers:
+//   Long:  MACD below zero, heading up   (bearish momentum building a turn)
+//   Short: MACD above zero, heading down (bullish momentum dying)
 macdLine   = hma(close, macdFast) - hma(close, macdSlow)
 signalLine = hma(macdLine, macdSig)
-macdBullCross = ta.crossover(macdLine, signalLine) and macdLine < 0
-macdBearCross = ta.crossunder(macdLine, signalLine) and macdLine > 0
 
-// Qualifying cross, counted only on closed bars (bar[1]/bar[2]); the live
-// forming bar is ignored so the status never flickers and then retracts.
-longAt1  = macdBullCross[1]
-longAt2  = macdBullCross[2]
-shortAt1 = macdBearCross[1]
-shortAt2 = macdBearCross[2]
-longOK   = longAt1  or longAt2
-shortOK  = shortAt1 or shortAt2
-macdStatus = longOK and shortOK ? (longAt1 ? "LONG OK" : "SHORT OK") : longOK ? "LONG OK" : shortOK ? "SHORT OK" : "WAIT"
-macdStatusCol = macdStatus == "LONG OK" ? #00ffbb : macdStatus == "SHORT OK" ? #ff1100 : #888888
+macdLongGate  = macdLine < 0 and macdLine > macdLine[1]
+macdShortGate = macdLine > 0 and macdLine < macdLine[1]
+macdStatus = macdLongGate ? "LONG OK" : macdShortGate ? "SHORT OK" : "WAIT"
+macdStatusCol = macdLongGate ? #00ffbb : macdShortGate ? #ff1100 : #888888
 
 macdSide = macdLine >= 0 ? "Above 0" : "Below 0"
 macdDir  = macdLine > macdLine[1] ? "↑" : "↓"
@@ -495,8 +493,8 @@ macdSetupCol = macdLine >= 0 ? (macdLine > macdLine[1] ? #cccc00 : #ff1100) : (m
 // Long: bar opens above a gap zone, trades into it, closes back above it.
 // Short: bar opens below a gap zone, trades into it, closes back below it.
 
-longConf  = (not reqTrend or tfBullCount == 3) and (not reqVwap or vwapBullish)       and (not reqMacd or macdLine >= 0)
-shortConf = (not reqTrend or tfBearCount == 3) and (not reqVwap or not vwapBullish)   and (not reqMacd or macdLine <= 0)
+longConf  = (not reqTrend or tfBullCount == 3) and (not reqVwap or vwapBullish)       and (not reqMacd or macdLongGate)
+shortConf = (not reqTrend or tfBearCount == 3) and (not reqVwap or not vwapBullish)   and (not reqMacd or macdShortGate)
 
 bool rejUp = false
 bool rejDn = false
@@ -522,8 +520,13 @@ cNeut = #888888
 cLbl  = #aaaacc
 sz    = sizeFromInput(tblSize)
 
+var table tbl = na
+if barstate.islast and not modDash and not na(tbl)
+    table.delete(tbl)
+    tbl := na
 if barstate.islast and modDash
-    var tbl = table.new(posFromInput(tblPos), 2, 8, bgcolor=color.new(#1a1a2e, 10), border_width=1, border_color=#333355, frame_color=#444477, frame_width=1)
+    if na(tbl)
+        tbl := table.new(posFromInput(tblPos), 2, 8, bgcolor=color.new(#1a1a2e, 10), border_width=1, border_color=#333355, frame_color=#444477, frame_width=1)
     table.cell(tbl, 0, 0, "TREND DASHBOARD", text_color=#8888cc, text_size=sz)
     table.cell(tbl, 1, 0, "", text_color=#8888cc, text_size=sz)
     table.cell(tbl, 0, 1, "65min Trend", text_color=cLbl, text_size=sz)
@@ -536,15 +539,20 @@ if barstate.islast and modDash
     table.cell(tbl, 1, 4, str.tostring(tfBullCount) + "B / " + str.tostring(tfBearCount) + "S", text_color=tfBullCount >= 3 ? cBull : tfBearCount >= 3 ? cBear : #cccc00, text_size=sz, text_halign=text.align_center)
     table.cell(tbl, 0, 5, "VWAP Bias", text_color=cLbl, text_size=sz)
     table.cell(tbl, 1, 5, vwapBullish ? "ABOVE" : "BELOW", text_color=vwapBullish ? cBull : cBear, text_size=sz, text_halign=text.align_center)
-    table.cell(tbl, 0, 6, "MACD Cross", text_color=cLbl, text_size=sz)
+    table.cell(tbl, 0, 6, "MACD Gate", text_color=cLbl, text_size=sz)
     table.cell(tbl, 1, 6, macdStatus, text_color=macdStatusCol, text_size=sz, text_halign=text.align_center)
     table.cell(tbl, 0, 7, "MACD Setup", text_color=cLbl, text_size=sz)
     table.cell(tbl, 1, 7, macdSetup, text_color=macdSetupCol, text_size=sz, text_halign=text.align_center)
 
 // ─── STATUS BOX ──────────────────────────────────────────────────────────────
 
+var table st = na
+if barstate.islast and not (showStatus and modGaps) and not na(st)
+    table.delete(st)
+    st := na
 if barstate.islast and showStatus and modGaps
-    var table st = table.new(posFromInput(statusPos), 2, 6, bgcolor=color.new(#1a1a2e, 10), border_width=1, border_color=#333355, frame_color=#444477, frame_width=1)
+    if na(st)
+        st := table.new(posFromInput(statusPos), 2, 6, bgcolor=color.new(#1a1a2e, 10), border_width=1, border_color=#333355, frame_color=#444477, frame_width=1)
     nStored = array.size(dayHi)
     contains = "none"
     if nStored > 0
