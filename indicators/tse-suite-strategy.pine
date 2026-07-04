@@ -1,0 +1,789 @@
+//@version=6
+// ═════════════════════════════════════════════════════════════════════════════
+// TSE SUITE — VP Gap Reversal toolkit (Bitcoin + US30 in one indicator)
+// -------------------------------------------------------------------------
+// Market preset switch: both presets anchor at the Tokyo open; the trend is
+// a 5-calendar-day Hull MA per timeframe over all traded hours — Bitcoin
+// 1440/480/111, US30 1380/460/106. Manual frees the Session Anchor and HMA
+// inputs. All gap detection and cleanliness settings are %-based and
+// market-neutral.
+// -------------------------------------------------------------------------
+// Combines the three standalone tools into ONE indicator sharing ONE profile
+// engine, so the histogram you look at and the gap lines you trade are built
+// from the SAME bins with the SAME detector:
+//
+//   MODULE 1 — Session Volume Profile histogram (VP Gaps)
+//   MODULE 2 — Gap levels with coupon lifecycle + touch-rejection signals
+//   MODULE 3 — Trend Dashboard (multi-TF HMA, VWAP bias, Zero Lag MACD)
+//
+// Gap level lifecycle ("coupons"):
+//   Every completed session's detected gap zones enter a persistent registry,
+//   each with N coupons (default 2) and its source profile's price range.
+//   Lines are drawn ONCE per session, at the session open, and stay for the
+//   whole day: every registry level that still has coupons AND whose source
+//   profile range contains the session-open price is drawn as right-extended
+//   line(s). During the day, each touch-rejection at a drawn level spends one
+//   coupon (committed on bar close) — the line does NOT disappear intraday.
+//   At the next session open, levels whose coupons are spent are simply not
+//   drawn again. Unused levels persist across sessions (days back if needed)
+//   until a max-age cutoff.
+//
+// Other fixes carried in from the audits:
+//  • Volume distributed across each 1-min bar's high–low range (both old
+//    scripts binned everything at the close, exaggerating gaps).
+//  • One shared gap detector (the VP script's validated settings).
+//  • "Session" VWAP anchored to the session anchor, not the broker daily bar.
+//  • Zero Lag MACD reversal gate: long = MACD below zero heading up,
+//    short = above zero heading down. No crossovers.
+// ═════════════════════════════════════════════════════════════════════════════
+// ─── STRATEGY VERSION ────────────────────────────────────────────────────────
+// Same engine as the TSE Suite indicator, plus order execution for backtesting:
+//   Entry:  touch-rejection at a drawn gap level with confluence (A/B grading,
+//           VWAP bias, Zero Lag MACD gate), on bar close — strategy rule 7.
+//   Stop:   just beyond the FAR side of the gap zone (price accepted back
+//           into the gap = thesis wrong), padded by a % buffer.
+//   Target: the source day's POC (the high-volume area the gap should snap
+//           back into) or a fixed R multiple — your choice.
+// Defaults assume crypto: 0.05% taker commission, small slippage. Adjust in
+// Properties to match your venue before trusting any backtest numbers.
+strategy("TSE Suite Strategy — VP Gap Reversal", shorttitle="TSE Strat", overlay=true, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=10, commission_type=strategy.commission.percent, commission_value=0.05, slippage=2, pyramiding=0, process_orders_on_close=true, max_boxes_count=500, max_lines_count=500, max_labels_count=200)
+
+// ─── MODULE TOGGLES ──────────────────────────────────────────────────────────
+
+grpMod = "Modules"
+modHist = input.bool(true, "Volume Profile histogram", group=grpMod)
+modGaps = input.bool(true, "Gap levels + signals", group=grpMod)
+modDash = input.bool(true, "Trend Dashboard", group=grpMod)
+
+// ─── MARKET PRESET ───────────────────────────────────────────────────────────
+// One indicator for both markets. The preset sets the session anchor and the
+// HMA trend calibration; everything else (gap thresholds, distance filter,
+// coupons) is percentage-based and works identically on any symbol.
+//   The HMA periods represent a 5-CALENDAR-DAY Hull moving average on each
+//   timeframe, counting all traded hours. Bitcoin (24h/day): 288×5=1440
+//   five-min, 96×5=480 fifteen-min, ~22×5=111 sixty-five-min. US30 CFD
+//   (~23h/day): 276×5=1380 five-min, 92×5=460 fifteen-min, ~21×5=106
+//   sixty-five-min. (Shannon's original 390/130/30 are 5 days of 6.5h
+//   equity-session bars — use Manual to run those literal numbers.)
+//   Bitcoin: Tokyo-open anchor; 5-day HMAs 1440/480/111.
+//   US30:    Tokyo-open anchor; 5-day HMAs 1380/460/106.
+//   Manual:  use the Session Anchor and HMA Trend inputs below as-is.
+
+grpMkt = "Market"
+mktPreset = input.string("Bitcoin", "Market preset", options=["Bitcoin", "US30", "Manual"], group=grpMkt, tooltip="Both presets anchor sessions at the Tokyo open (9:00 Asia/Tokyo). The HMA trend is a 5-calendar-day Hull MA over all traded hours: Bitcoin 1440/480/111, US30 1380/460/106. Manual = use the Session Anchor and HMA inputs below (e.g. Shannon's literal 390/130/30).")
+presetBTC = mktPreset == "Bitcoin"
+presetUS  = mktPreset == "US30"
+
+// ─── SESSION / PROFILE (shared engine) ───────────────────────────────────────
+
+grpSes = "Session / Profile"
+anchorMode = input.string("Tokyo Open", "Session Anchor", options=["Tokyo Open", "Custom"], group=grpSes, tooltip="Used only when Market preset = Manual. Tokyo Open = 9:00 AM Japan time automatically (~8pm ET summer / 7pm ET winter, never drifts — Japan has no DST). Custom = set your own time below.")
+cusHr  = input.int(20, "Custom Start Hour", 0, 23, group=grpSes, tooltip="Only used when Market preset = Manual and Session Anchor = Custom. 24h clock, in the Custom Timezone below. 20 = 8:00 PM Eastern.")
+cusMin = input.int(0,  "Custom Start Minute", 0, 59, group=grpSes)
+cusTz  = input.string("America/New_York", "Custom Timezone", group=grpSes, tooltip="Only used when Market preset = Manual and Session Anchor = Custom. IANA name, e.g. America/New_York. DST handled automatically.")
+
+startHr  = presetBTC or presetUS ? 9 : (anchorMode == "Tokyo Open" ? 9 : cusHr)
+startMin = presetBTC or presetUS ? 0 : (anchorMode == "Tokyo Open" ? 0 : cusMin)
+sesTz    = presetBTC or presetUS ? "Asia/Tokyo" : (anchorMode == "Tokyo Open" ? "Asia/Tokyo" : cusTz)
+
+profileRows = input.int(100, "Profile Rows (bins)", 20, 300, group=grpSes, tooltip="More rows = finer price levels, heavier drawing.")
+vaPct       = input.float(68, "Value Area %", 50, 90, 1, group=grpSes, tooltip="Percentage of session volume that defines the value area. You use 68%.") / 100.0
+ltfFeed     = input.timeframe("1", "Volume Feed Timeframe", group=grpSes, tooltip="The profile is built from this fixed feed, so it is identical on any chart timeframe. 1-min recommended.")
+
+// ─── HISTOGRAM DISPLAY (module 1) ────────────────────────────────────────────
+
+grpHist = "Histogram Display"
+histWidthBars = input.int(20, "Histogram Width (bars)", 5, 200, group=grpHist, tooltip="How far the histogram bars extend right of each session start.")
+showPOC  = input.bool(true, "Show POC line (yellow)",  group=grpHist)
+showVA   = input.bool(true, "Show VAH/VAL lines (blue dashed)", group=grpHist)
+showVWAP = input.bool(false, "Show session VWAP line", group=grpHist)
+showGapCheck = input.bool(true, "Show gap check markers", group=grpHist, tooltip="Faint dotted line at each detected gap on every completed session, so you can confirm the detector fires where the histogram shows a void.")
+colValueArea = input.color(#2962ff, "Value Area bars", group=grpHist)
+colLowArea   = input.color(#b2b5be, "Low Value Area bars (tails)", group=grpHist)
+colPOC   = input.color(#ffff00, "POC line", group=grpHist)
+colVA    = input.color(#4488ff, "VAH/VAL line", group=grpHist)
+
+// ─── GAP DETECTION (shared — one detector for histogram markers AND levels) ──
+
+grpGap = "Gap Detection"
+lvnPct     = input.float(25, "LVN zone threshold (% of POC)", 5, 60, 1, group=grpGap, tooltip="Bins at or below this % of POC volume count as low-volume.")
+lvnMinBins = input.int(5, "Min LVN zone size (bins)", 2, 30, group=grpGap)
+gapPct     = input.float(5, "Gap threshold (% of POC)", 1, 30, 1, group=grpGap, tooltip="Inside an LVN zone, bins this thin are gap candidates.")
+gapMinBins = input.int(2, "Min gap size (bins)", 1, 15, group=grpGap)
+tailOnly   = input.bool(true, "Only gaps outside the value area", group=grpGap, tooltip="ON (per strategy spec) = only gaps outside the 68% value area.")
+promEnable = input.bool(true, "Require flanking HVN peaks (prominence)", group=grpGap, tooltip="A valid cliff must sit between volume clusters. Filters out the always-thin bins at the day's range extremes.")
+promBoth   = input.bool(true, "Require peaks on BOTH sides", group=grpGap)
+promRatio  = input.float(2.5, "Prominence ratio (peak / valley)", 1.2, 6.0, 0.1, group=grpGap)
+
+// ─── GAP LEVEL LIFECYCLE (module 2) ──────────────────────────────────────────
+
+grpLife = "Gap Level Lifecycle"
+couponsPer = input.int(2, "Coupons per level (uses before retired)", 1, 5, group=grpLife, tooltip="Each touch-rejection at a drawn level spends one coupon. Lines never disappear intraday — a used-up level is simply not drawn again at the next session open.")
+couponMode = input.string("Any rejection", "Coupon counts on", options=["Any rejection", "Confluence signals only"], group=grpLife, tooltip="Any rejection = every time price trades into the level and closes back away, whether or not the dashboard confluences agreed. Confluence signals only = only triangles (full signal) spend coupons.")
+maxAgeDays = input.int(6, "Max level age (sessions)", 1, 20, group=grpLife, tooltip="Unused levels older than this many completed sessions are dropped from the registry.")
+fallbackRecent = input.bool(true, "If nothing qualifies, draw newest day's levels", group=grpLife, tooltip="If the session opens outside every source profile's range (gap open), draw the most recent session's unused levels anyway instead of nothing.")
+
+grpClean = "Chart Cleanliness"
+maxDraw     = input.int(6, "Max levels drawn per session", 1, 20, group=grpClean, tooltip="If more levels qualify, the ones NEAREST to the session-open price win. 6 levels = at most 12 lines in Zone edges mode.")
+maxDistPct  = input.float(1.0, "Only draw levels within % of price", 0.0, 5.0, 0.1, group=grpClean, tooltip="Levels farther than this from the session-open price are skipped — they are not actionable intraday. They stay in the registry and can draw on a later day when price comes to them. 0 = no distance filter.")
+mergeOverlap = input.bool(true, "Merge overlapping levels (keep newest)", group=grpClean, tooltip="When levels from different days overlap in price, draw only the newest one. The older duplicates stay in the registry.")
+
+grpDisp = "Gap Lines"
+showGapLines = input.bool(true, "Show gap lines", group=grpDisp)
+gapPlace     = input.string("Zone edges", "Gap line placement", options=["Zone edges", "Zone center"], group=grpDisp, tooltip="Zone edges = two lines bounding each gap zone. Zone center = one line at the middle.")
+colGapLine   = input.color(#ff5030, "Gap line color", group=grpDisp)
+gapStyleIn   = input.string("Solid", "Gap line style", options=["Solid", "Dashed", "Dotted"], group=grpDisp)
+gapWidth     = input.int(2, "Gap line width", 1, 4, group=grpDisp)
+showSrcLabels = input.bool(true, "Label each line with its source day", group=grpDisp)
+
+grpSig = "Signals"
+showSignals = input.bool(true, "Show touch-rejection signals", group=grpSig, tooltip="Triangle when a bar comes into a drawn gap level and closes back away from it. Set alerts to fire Once Per Bar Close.")
+alignReq = input.string("A (5+15+65)", "Trend alignment required", options=["A (5+15+65)", "B or better (5+15)", "Off"], group=grpSig, tooltip="A setup = 5, 15 AND 65 min trends aligned. B setup = 5 and 15 aligned, 65 disagrees. 'B or better' accepts both grades; triangles are lettered A or B so you can tell them apart. Off = no trend requirement.")
+reqVwap  = input.bool(true, "Require VWAP bias", group=grpSig, tooltip="Long: price above VWAP. Short: below.")
+reqMacd  = input.bool(true, "Require Zero Lag MACD gate", group=grpSig, tooltip="Reversal gate. Long: MACD line BELOW zero and heading up (bearish momentum dying). Short: ABOVE zero and heading down. No crossovers.")
+
+grpStrat = "Strategy"
+enableLongs  = input.bool(true, "Take long trades", group=grpStrat)
+enableShorts = input.bool(true, "Take short trades", group=grpStrat)
+tgtMode  = input.string("Source day POC", "Target", options=["Source day POC", "R multiple"], group=grpStrat, tooltip="Source day POC = exit where the source session's volume peaked (the area the gap should snap back into). If the POC is on the wrong side of entry, the R multiple is used as fallback.")
+rrMult   = input.float(2.0, "R multiple", 0.5, 10, 0.25, group=grpStrat, tooltip="Target distance as a multiple of entry-to-stop risk (used in R-multiple mode and as POC fallback).")
+stopBufPct = input.float(0.1, "Stop buffer (% of price)", 0.0, 2.0, 0.05, group=grpStrat, tooltip="Stop sits this far beyond the far edge of the gap zone. Price trading through the whole zone means the rejection failed.")
+exitOpp  = input.bool(false, "Exit on opposite signal", group=grpStrat, tooltip="Close an open position if a confluence-gated rejection fires the other way before stop/target is hit.")
+
+grpDbg = "Status Box"
+showStatus = input.bool(true, "Show status box", group=grpDbg)
+statusPos  = input.string("Bottom Right", "Status box position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Right"], group=grpDbg)
+
+// ─── TREND DASHBOARD (module 3) ──────────────────────────────────────────────
+
+grpHMA = "HMA Trend (5-day Hull MA per timeframe)"
+hma5LenIn  = input.int(390, "5-min HMA Period",  minval=2, group=grpHMA, tooltip="Used only when Market preset = Manual. 5-day HMA: 390 = 5 equity days of 5-min bars (78/day). A 24h market's 5-day = 1440.")
+hma15LenIn = input.int(130, "15-min HMA Period", minval=2, group=grpHMA, tooltip="Used only when Market preset = Manual. 5-day HMA: 130 = 5 equity days of 15-min bars (26/day). A 24h market's 5-day = 480.")
+hma65LenIn = input.int(30,  "65-min HMA Period", minval=2, group=grpHMA, tooltip="Used only when Market preset = Manual. 5-day HMA: 30 = 5 equity days of 65-min bars (6/day). A 24h market's 5-day ≈ 111.")
+
+// Preset calibration: the trend is a 5-calendar-day Hull MA on every
+// timeframe, counting all traded hours. Bitcoin 24h/day → 1440/480/111.
+// US30 CFD ~23h/day → 1380/460/106.
+hma5Len  = presetBTC ? 1440 : presetUS ? 1380 : hma5LenIn
+hma15Len = presetBTC ? 480  : presetUS ? 460  : hma15LenIn
+hma65Len = presetBTC ? 111  : presetUS ? 106  : hma65LenIn
+
+grpMACD = "Zero Lag MACD (HMA)"
+macdFast = input.int(12, "Fast HMA period", minval=1, group=grpMACD)
+macdSlow = input.int(24, "Slow HMA period", minval=1, group=grpMACD)
+macdSig  = input.int(11, "Signal HMA period", minval=1, group=grpMACD, tooltip="Signal line is informational only — the trade gate uses the MACD line's position vs zero and its direction, not crossovers.")
+
+grpVWAP = "VWAP"
+vwapAnchor = input.string("Session", "VWAP Anchor", options=["Session", "Week", "Month"], group=grpVWAP, tooltip="Session = resets at your session anchor above, not the broker's daily bar.")
+
+grpBox = "Dashboard"
+tblPos  = input.string("Top Right", "Box Position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Right"], group=grpBox)
+tblSize = input.string("Small", "Text Size", options=["Tiny", "Small", "Normal"], group=grpBox)
+
+// ─── CONSTANTS / HELPERS ─────────────────────────────────────────────────────
+
+int MAXGAPS  = 30     // max gaps detected per session
+int MAXZONES = 60     // max registry levels retained (oldest dropped first)
+
+gapStyle = gapStyleIn == "Dashed" ? line.style_dashed : gapStyleIn == "Dotted" ? line.style_dotted : line.style_solid
+
+sessAnchorOf(int t) =>
+    aToday = timestamp(sesTz, year(t, sesTz), month(t, sesTz), dayofmonth(t, sesTz), startHr, startMin)
+    tp     = t - 86400000
+    aPrev  = timestamp(sesTz, year(tp, sesTz), month(tp, sesTz), dayofmonth(tp, sesTz), startHr, startMin)
+    t >= aToday ? aToday : aPrev
+
+hma(src, len) =>
+    half = math.round(len / 2)
+    sq   = math.round(math.sqrt(len))
+    ta.wma(2 * ta.wma(src, half) - ta.wma(src, len), sq)
+
+posFromInput(p) =>
+    p == "Top Left" ? position.top_left : p == "Bottom Right" ? position.bottom_right : p == "Bottom Left" ? position.bottom_left : p == "Middle Right" ? position.middle_right : position.top_right
+
+sizeFromInput(s) =>
+    s == "Tiny" ? size.tiny : s == "Normal" ? size.normal : size.small
+
+// ─── STATE ───────────────────────────────────────────────────────────────────
+
+var array<float> rawHi  = array.new_float()
+var array<float> rawLo  = array.new_float()
+var array<float> rawVol = array.new_float()
+var int  curAnchor = na
+var int  sStartBar = na
+var bool skipFirst = true
+
+// Level registry (parallel arrays). A level = one gap zone plus its source
+// profile's range, remaining coupons, birth anchor, and label tag. Whether it
+// is drawn this session is a flag; drawing objects live in separate arrays
+// that are cleared and rebuilt once per session at the open.
+var array<float>  azLo    = array.new_float()
+var array<float>  azHi    = array.new_float()
+var array<float>  azDayLo = array.new_float()
+var array<float>  azDayHi = array.new_float()
+var array<float>  azPoc   = array.new_float()   // source day's POC (strategy target)
+var array<int>    azUses  = array.new_int()
+var array<int>    azBorn  = array.new_int()
+var array<string> azTag   = array.new_string()
+var array<bool>   azDrawn = array.new_bool()
+
+var array<line>  drawnGapLines  = array.new_line()
+var array<label> drawnGapLabels = array.new_label()
+
+// ─── LEVEL REGISTRY OPS ──────────────────────────────────────────────────────
+
+dropLevel(int j) =>
+    array.remove(azLo, j)
+    array.remove(azHi, j)
+    array.remove(azDayLo, j)
+    array.remove(azDayHi, j)
+    array.remove(azPoc, j)
+    array.remove(azUses, j)
+    array.remove(azBorn, j)
+    array.remove(azTag, j)
+    array.remove(azDrawn, j)
+    true
+
+addLevel(float zLo, float zHi, float dLo, float dHi, float dPoc, string tag) =>
+    if array.size(azLo) >= MAXZONES
+        dropLevel(0)
+    array.push(azLo, zLo)
+    array.push(azHi, zHi)
+    array.push(azDayLo, dLo)
+    array.push(azDayHi, dHi)
+    array.push(azPoc, dPoc)
+    array.push(azUses, couponsPer)
+    array.push(azBorn, curAnchor)
+    array.push(azTag, tag)
+    array.push(azDrawn, false)
+    true
+
+// Draw one registry level as static, right-extended line(s) for this session.
+drawLevel(int j) =>
+    zLo = array.get(azLo, j)
+    zHi = array.get(azHi, j)
+    tag = array.get(azTag, j)
+    if gapPlace == "Zone center"
+        mid = (zLo + zHi) / 2.0
+        array.push(drawnGapLines, line.new(bar_index, mid, bar_index + 1, mid, xloc.bar_index, extend.right, colGapLine, gapStyle, gapWidth))
+        if showSrcLabels
+            array.push(drawnGapLabels, label.new(bar_index, mid, tag, xloc.bar_index, yloc.price, color.new(color.black, 100), label.style_none, textcolor=colGapLine, size=size.tiny))
+    else
+        array.push(drawnGapLines, line.new(bar_index, zLo, bar_index + 1, zLo, xloc.bar_index, extend.right, colGapLine, gapStyle, gapWidth))
+        array.push(drawnGapLines, line.new(bar_index, zHi, bar_index + 1, zHi, xloc.bar_index, extend.right, colGapLine, gapStyle, gapWidth))
+        if showSrcLabels
+            array.push(drawnGapLabels, label.new(bar_index, zHi, tag, xloc.bar_index, yloc.price, color.new(color.black, 100), label.style_none, textcolor=colGapLine, size=size.tiny))
+    array.set(azDrawn, j, true)
+    true
+
+midOf(int j) =>
+    (array.get(azLo, j) + array.get(azHi, j)) / 2.0
+
+// ONCE PER SESSION, at the open: clear last session's lines and pick what to
+// draw. A level qualifies when it still has coupons, its source profile range
+// contains the session-open price, and it sits within the distance filter.
+// Overlapping duplicates collapse to the newest, and if more than the max
+// still qualify, the nearest to price win. Levels hit out during the prior
+// day simply don't reappear. Nothing is added or removed intraday.
+redrawLevels(float price) =>
+    while array.size(drawnGapLines) > 0
+        line.delete(array.pop(drawnGapLines))
+    while array.size(drawnGapLabels) > 0
+        label.delete(array.pop(drawnGapLabels))
+    nReg = array.size(azLo)
+    if nReg > 0
+        for j = 0 to nReg - 1
+            array.set(azDrawn, j, false)
+    if modGaps and showGapLines and nReg > 0
+        // Candidates: coupons left + price inside source profile + near price.
+        cand = array.new_int()
+        for j = 0 to nReg - 1
+            if array.get(azUses, j) > 0 and price <= array.get(azDayHi, j) and price >= array.get(azDayLo, j)
+                if maxDistPct <= 0 or math.abs(price - midOf(j)) <= price * maxDistPct / 100.0
+                    array.push(cand, j)
+        // Gap open outside every profile: fall back to the newest session's
+        // unused levels (distance filter still applies) so the chart isn't empty.
+        if array.size(cand) == 0 and fallbackRecent
+            newestBorn = 0
+            for j = 0 to nReg - 1
+                if array.get(azUses, j) > 0 and array.get(azBorn, j) > newestBorn
+                    newestBorn := array.get(azBorn, j)
+            if newestBorn > 0
+                for j = 0 to nReg - 1
+                    if array.get(azUses, j) > 0 and array.get(azBorn, j) == newestBorn
+                        if maxDistPct <= 0 or math.abs(price - midOf(j)) <= price * maxDistPct / 100.0
+                            array.push(cand, j)
+        // Collapse overlapping duplicates, newest source day first.
+        kept = array.new_int()
+        if mergeOverlap
+            while array.size(cand) > 0
+                bi = 0
+                if array.size(cand) > 1
+                    for i = 1 to array.size(cand) - 1
+                        if array.get(azBorn, array.get(cand, i)) > array.get(azBorn, array.get(cand, bi))
+                            bi := i
+                j = array.get(cand, bi)
+                array.remove(cand, bi)
+                ov = false
+                if array.size(kept) > 0
+                    for k = 0 to array.size(kept) - 1
+                        kj = array.get(kept, k)
+                        if array.get(azLo, j) <= array.get(azHi, kj) and array.get(azHi, j) >= array.get(azLo, kj)
+                            ov := true
+                if not ov
+                    array.push(kept, j)
+        else
+            if array.size(cand) > 0
+                for i = 0 to array.size(cand) - 1
+                    array.push(kept, array.get(cand, i))
+        // Draw up to maxDraw levels, nearest to price first.
+        drawn = 0
+        while array.size(kept) > 0 and drawn < maxDraw
+            bi = 0
+            if array.size(kept) > 1
+                for i = 1 to array.size(kept) - 1
+                    if math.abs(price - midOf(array.get(kept, i))) < math.abs(price - midOf(array.get(kept, bi)))
+                        bi := i
+            drawLevel(array.get(kept, bi))
+            array.remove(kept, bi)
+            drawn += 1
+    true
+
+// ─── GAP DETECTION (shared) ──────────────────────────────────────────────────
+// Returns the bottom/top price bounds of each gap zone in one finished profile.
+
+detectGaps(array<float> bins, float pLo, float bStep, int pocI, int vLo, int vHi, float pocV) =>
+    outLo = array.new_float()
+    outHi = array.new_float()
+    if pocV > 0
+        lvnThr = lvnPct / 100.0
+        gapThr = gapPct / 100.0
+        zi = 0
+        while zi < profileRows
+            if array.get(bins, zi) / pocV <= lvnThr
+                zj = zi
+                while zj + 1 < profileRows and array.get(bins, zj + 1) / pocV <= lvnThr
+                    zj += 1
+                if (zj - zi + 1) >= lvnMinBins
+                    gi = zi
+                    while gi <= zj
+                        if array.get(bins, gi) / pocV <= gapThr
+                            gj = gi
+                            while gj + 1 <= zj and array.get(bins, gj + 1) / pocV <= gapThr
+                                gj += 1
+                            if (gj - gi + 1) >= gapMinBins
+                                outVA = gj < vLo or gi > vHi
+                                pass = (not tailOnly) or outVA
+                                if pass and promEnable
+                                    valley = array.get(bins, gi)
+                                    for k = gi to gj
+                                        valley := math.min(valley, array.get(bins, k))
+                                    peakL = 0.0
+                                    if gi >= 1
+                                        for k = 0 to gi - 1
+                                            peakL := math.max(peakL, array.get(bins, k))
+                                    peakR = 0.0
+                                    if gj <= profileRows - 2
+                                        for k = gj + 1 to profileRows - 1
+                                            peakR := math.max(peakR, array.get(bins, k))
+                                    okL = valley <= 0 ? peakL > 0 : peakL >= promRatio * valley
+                                    okR = valley <= 0 ? peakR > 0 : peakR >= promRatio * valley
+                                    pass := promBoth ? (okL and okR) : (gj < pocI ? okR : okL)
+                                if pass and array.size(outLo) < MAXGAPS
+                                    array.push(outLo, pLo + gi * bStep)
+                                    array.push(outHi, pLo + (gj + 1) * bStep)
+                            gi := gj + 1
+                        else
+                            gi += 1
+                zi := zj + 1
+            else
+                zi += 1
+    [outLo, outHi]
+
+// ─── FINALIZE one completed session ──────────────────────────────────────────
+// Builds the profile ONCE (volume spread across each feed bar's high–low),
+// draws the histogram + POC/VA + gap-check markers (module 1), ages out stale
+// registry levels, and registers the session's new gap levels (module 2).
+
+finalizeSession() =>
+    n = array.size(rawVol)
+    if n > 0
+        pHi = array.max(rawHi)
+        pLo = array.min(rawLo)
+        bStep = (pHi - pLo) <= 0 ? syminfo.mintick : (pHi - pLo) / profileRows
+        bins = array.new_float(profileRows, 0.0)
+        for i = 0 to n - 1
+            bh = array.get(rawHi, i)
+            bl = array.get(rawLo, i)
+            b0 = math.min(math.max(math.floor((bl - pLo) / bStep), 0), profileRows - 1)
+            b1 = math.min(math.max(math.floor((bh - pLo) / bStep), 0), profileRows - 1)
+            vPer = array.get(rawVol, i) / (b1 - b0 + 1)
+            for b = b0 to b1
+                array.set(bins, b, array.get(bins, b) + vPer)
+
+        pocI = 0
+        pocV = 0.0
+        totV = 0.0
+        for i = 0 to profileRows - 1
+            vv = array.get(bins, i)
+            totV += vv
+            if vv > pocV
+                pocV := vv
+                pocI := i
+        poc = pLo + (pocI + 0.5) * bStep
+
+        vLo = pocI
+        vHi = pocI
+        cv  = pocV
+        while cv < vaPct * totV and (vLo > 0 or vHi < profileRows - 1)
+            vRight = vHi < profileRows - 1 ? array.get(bins, vHi + 1) : na
+            vLeft  = vLo > 0               ? array.get(bins, vLo - 1) : na
+            if na(vRight) or (not na(vLeft) and vLeft >= nz(vRight, 0))
+                cv += nz(vLeft, 0)
+                vLo -= 1
+            else if na(vLeft) or (not na(vRight) and vRight > vLeft)
+                cv += nz(vRight, 0)
+                vHi += 1
+            else
+                cv += nz(vRight, 0) + nz(vLeft, 0)
+                vHi += 1
+                vLo -= 1
+        vah = pLo + (vHi + 1) * bStep
+        val = pLo + vLo * bStep
+
+        // One detector run feeds BOTH the histogram markers and the registry.
+        [gapsLo, gapsHi] = detectGaps(bins, pLo, bStep, pocI, vLo, vHi, pocV)
+
+        // ── Module 1: histogram + POC/VA + gap-check markers (persistent) ────
+        endBar = bar_index
+        if modHist
+            if pocV > 0
+                for i = 0 to profileRows - 1
+                    vol = array.get(bins, i)
+                    if vol > 0
+                        barW = int(histWidthBars * (vol / pocV))
+                        if barW > 0
+                            inVA  = i >= vLo and i <= vHi
+                            bxCol = inVA ? colValueArea : colLowArea
+                            box.new(sStartBar, pLo + i * bStep, sStartBar + barW, pLo + (i + 1) * bStep, bgcolor=color.new(bxCol, 60), border_color=color.new(bxCol, 30), xloc=xloc.bar_index)
+            if showPOC
+                line.new(sStartBar, poc, endBar, poc, xloc.bar_index, extend.none, colPOC, line.style_solid, 2)
+            if showVA
+                line.new(sStartBar, vah, endBar, vah, xloc.bar_index, extend.none, color.new(colVA, 40), line.style_dashed, 1)
+                line.new(sStartBar, val, endBar, val, xloc.bar_index, extend.none, color.new(colVA, 40), line.style_dashed, 1)
+            if showGapCheck and array.size(gapsLo) > 0
+                for g = 0 to array.size(gapsLo) - 1
+                    gMid = (array.get(gapsLo, g) + array.get(gapsHi, g)) / 2.0
+                    line.new(sStartBar, gMid, endBar, gMid, xloc.bar_index, extend.none, colGapLine, line.style_dotted, 1)
+
+        // ── Module 2: age out stale levels, then register the new ones ───────
+        if array.size(azBorn) > 0
+            for j = array.size(azBorn) - 1 to 0
+                if curAnchor - array.get(azBorn, j) >= maxAgeDays * 86400000
+                    dropLevel(j)
+        if array.size(gapsLo) > 0
+            tag = str.format_time(curAnchor + 86400000, "MMM d", sesTz)
+            for g = 0 to array.size(gapsLo) - 1
+                addLevel(array.get(gapsLo, g), array.get(gapsHi, g), pLo, pHi, poc, tag)
+    true
+
+// ─── ACCUMULATE 1-min feed, detect session boundaries, finalize + redraw ─────
+
+ltfH = request.security_lower_tf(syminfo.tickerid, ltfFeed, high)
+ltfL = request.security_lower_tf(syminfo.tickerid, ltfFeed, low)
+ltfV = request.security_lower_tf(syminfo.tickerid, ltfFeed, volume)
+ltfT = request.security_lower_tf(syminfo.tickerid, ltfFeed, time)
+
+nSub = array.size(ltfT)
+if nSub > 0 and nSub == array.size(ltfH) and nSub == array.size(ltfL) and nSub == array.size(ltfV)
+    saFirst = sessAnchorOf(array.get(ltfT, 0))
+    saLast  = sessAnchorOf(array.get(ltfT, nSub - 1))
+    if saFirst == saLast
+        if na(curAnchor) or saFirst != curAnchor
+            if not na(curAnchor) and not skipFirst
+                finalizeSession()
+            skipFirst := na(curAnchor) ? skipFirst : false
+            array.clear(rawHi)
+            array.clear(rawLo)
+            array.clear(rawVol)
+            curAnchor := saFirst
+            sStartBar := bar_index
+            redrawLevels(close)
+        for i = 0 to nSub - 1
+            array.push(rawHi,  array.get(ltfH, i))
+            array.push(rawLo,  array.get(ltfL, i))
+            array.push(rawVol, array.get(ltfV, i))
+    else
+        for i = 0 to nSub - 1
+            sa = sessAnchorOf(array.get(ltfT, i))
+            if na(curAnchor)
+                curAnchor := sa
+                sStartBar := bar_index
+            else if sa != curAnchor
+                if not skipFirst
+                    finalizeSession()
+                skipFirst := false
+                array.clear(rawHi)
+                array.clear(rawLo)
+                array.clear(rawVol)
+                curAnchor := sa
+                sStartBar := bar_index
+                redrawLevels(close)
+            array.push(rawHi,  array.get(ltfH, i))
+            array.push(rawLo,  array.get(ltfL, i))
+            array.push(rawVol, array.get(ltfV, i))
+else
+    sa = sessAnchorOf(time)
+    if na(curAnchor)
+        curAnchor := sa
+        sStartBar := bar_index
+    else if sa != curAnchor
+        if not skipFirst
+            finalizeSession()
+        skipFirst := false
+        array.clear(rawHi)
+        array.clear(rawLo)
+        array.clear(rawVol)
+        curAnchor := sa
+        sStartBar := bar_index
+        redrawLevels(close)
+    array.push(rawHi,  high)
+    array.push(rawLo,  low)
+    array.push(rawVol, volume)
+
+// ─── MODULE 3: TREND DASHBOARD CALCULATIONS ──────────────────────────────────
+// (Always computed — the signal gate uses these even if the box is hidden.)
+
+// HTF values use the last COMPLETED higher-timeframe bar ([1] + lookahead):
+// the classic non-repainting form. Historical bars see exactly what was
+// known live at that moment, so past triangles can be trusted. Trade-off:
+// a trend flip registers when the HTF bar closes, not mid-bar.
+hma65 = request.security(syminfo.tickerid, "65", hma(close, hma65Len)[1], barmerge.gaps_off, barmerge.lookahead_on)
+hma15 = request.security(syminfo.tickerid, "15", hma(close, hma15Len)[1], barmerge.gaps_off, barmerge.lookahead_on)
+hma5  = hma(close, hma5Len)
+
+tf65Bull = close > hma65
+tf65Bear = close < hma65
+tf15Bull = close > hma15
+tf15Bear = close < hma15
+tf5Bull  = close > hma5
+tf5Bear  = close < hma5
+
+tfBullCount = (tf65Bull ? 1 : 0) + (tf15Bull ? 1 : 0) + (tf5Bull ? 1 : 0)
+tfBearCount = (tf65Bear ? 1 : 0) + (tf15Bear ? 1 : 0) + (tf5Bear ? 1 : 0)
+
+// Setup grades: A = all three timeframes aligned; B = 5 and 15 aligned
+// while the 65 disagrees.
+trendLongA  = tf5Bull and tf15Bull and tf65Bull
+trendLongB  = tf5Bull and tf15Bull and not tf65Bull
+trendShortA = tf5Bear and tf15Bear and tf65Bear
+trendShortB = tf5Bear and tf15Bear and not tf65Bear
+
+gradeTxt = trendLongA ? "A LONG" : trendShortA ? "A SHORT" : trendLongB ? "B LONG" : trendShortB ? "B SHORT" : "—"
+gradeCol = trendLongA or trendLongB ? #00ffbb : trendShortA or trendShortB ? #ff1100 : #888888
+
+// VWAP — "Session" resets at YOUR session anchor, not the broker's daily bar.
+sesNew = sessAnchorOf(time) != sessAnchorOf(nz(time[1], time - 86400000))
+isNew = switch vwapAnchor
+    "Week"  => timeframe.change("W")
+    "Month" => timeframe.change("M")
+    => sesNew
+
+[_vwap, _u, _l] = ta.vwap(hlc3, isNew, 1)
+vwapBullish = close > _vwap
+plot(showVWAP ? _vwap : na, "VWAP", color.new(#00dddd, 30), 2)
+
+// Zero Lag MACD (HMA-based, same construction as the standalone script).
+// The gate is zero-line + direction — NO crossovers:
+//   Long:  MACD below zero, heading up   (bearish momentum building a turn)
+//   Short: MACD above zero, heading down (bullish momentum dying)
+macdLine   = hma(close, macdFast) - hma(close, macdSlow)
+signalLine = hma(macdLine, macdSig)
+
+macdLongGate  = macdLine < 0 and macdLine > macdLine[1]
+macdShortGate = macdLine > 0 and macdLine < macdLine[1]
+macdStatus = macdLongGate ? "LONG OK" : macdShortGate ? "SHORT OK" : "WAIT"
+macdStatusCol = macdLongGate ? #00ffbb : macdShortGate ? #ff1100 : #888888
+
+macdSide = macdLine >= 0 ? "Above 0" : "Below 0"
+macdDir  = macdLine > macdLine[1] ? "↑" : "↓"
+macdSetup = macdSide + " " + macdDir
+macdSetupCol = macdLine >= 0 ? (macdLine > macdLine[1] ? #cccc00 : #ff1100) : (macdLine > macdLine[1] ? #00ffbb : #cccc00)
+
+// ─── TOUCH-REJECTION SIGNALS + COUPON SPENDING ───────────────────────────────
+// Only levels DRAWN this session are live for signals and coupon spending.
+// Long: bar opens above a level, trades into it, closes back above it.
+// Short: bar opens below a level, trades into it, closes back below it.
+// Coupons commit on bar close; lines stay on screen until the next session
+// open regardless of how many coupons are spent.
+
+// Non-trend confluences (VWAP + Zero Lag MACD gate).
+longBase  = (not reqVwap or vwapBullish)     and (not reqMacd or macdLongGate)
+shortBase = (not reqVwap or not vwapBullish) and (not reqMacd or macdShortGate)
+
+// Which grades pass the alignment requirement. A passes everything;
+// B passes "B or better" and Off; ungraded passes only Off.
+allowB    = alignReq != "A (5+15+65)"
+allowNone = alignReq == "Off"
+
+bool rejUpA = false
+bool rejUpB = false
+bool rejUpN = false
+bool rejDnA = false
+bool rejDnB = false
+bool rejDnN = false
+// Zone that triggered the signal — drives the stop (far edge of the gap)
+// and the target (source day's POC).
+float trigUpLo  = na
+float trigUpPoc = na
+float trigDnHi  = na
+float trigDnPoc = na
+// barstate.isconfirmed: signals, coupons, and orders commit only on the bar
+// CLOSE (rule 7) — no mid-bar triangles that appear and then retract.
+if modGaps and barstate.isconfirmed and array.size(azLo) > 0
+    for j = 0 to array.size(azLo) - 1
+        if array.get(azDrawn, j) and array.get(azUses, j) > 0
+            zL = array.get(azLo, j)
+            zH = array.get(azHi, j)
+            hitUp = open > zH and low <= zH and close > zH
+            hitDn = open < zL and high >= zL and close < zL
+            sigUp = hitUp and longBase  and (trendLongA  or (trendLongB  and allowB) or allowNone)
+            sigDn = hitDn and shortBase and (trendShortA or (trendShortB and allowB) or allowNone)
+            if hitUp and longBase
+                if trendLongA
+                    rejUpA := true
+                else if trendLongB and allowB
+                    rejUpB := true
+                else if allowNone
+                    rejUpN := true
+            if hitDn and shortBase
+                if trendShortA
+                    rejDnA := true
+                else if trendShortB and allowB
+                    rejDnB := true
+                else if allowNone
+                    rejDnN := true
+            if sigUp and na(trigUpLo)
+                trigUpLo  := zL
+                trigUpPoc := array.get(azPoc, j)
+            if sigDn and na(trigDnHi)
+                trigDnHi  := zH
+                trigDnPoc := array.get(azPoc, j)
+            spend = couponMode == "Any rejection" ? (hitUp or hitDn) : (sigUp or sigDn)
+            if spend
+                array.set(azUses, j, array.get(azUses, j) - 1)
+
+rejUpAny = rejUpA or rejUpB or rejUpN
+rejDnAny = rejDnA or rejDnB or rejDnN
+
+plotshape(showSignals ? rejUpA : false, "Gap rejection A (long)", shape.triangleup, location.belowbar, color=#00ffbb, text="A", textcolor=#00ffbb, size=size.tiny)
+plotshape(showSignals ? rejUpB : false, "Gap rejection B (long)", shape.triangleup, location.belowbar, color=#ffcc00, text="B", textcolor=#ffcc00, size=size.tiny)
+plotshape(showSignals ? rejUpN : false, "Gap rejection (long, ungraded)", shape.triangleup, location.belowbar, color=#00ffbb, size=size.tiny)
+plotshape(showSignals ? rejDnA : false, "Gap rejection A (short)", shape.triangledown, location.abovebar, color=#ff5030, text="A", textcolor=#ff5030, size=size.tiny)
+plotshape(showSignals ? rejDnB : false, "Gap rejection B (short)", shape.triangledown, location.abovebar, color=#ffcc00, text="B", textcolor=#ffcc00, size=size.tiny)
+plotshape(showSignals ? rejDnN : false, "Gap rejection (short, ungraded)", shape.triangledown, location.abovebar, color=#ff5030, size=size.tiny)
+
+// ─── ORDER EXECUTION ─────────────────────────────────────────────────────────
+// Enter on the signal bar's close (process_orders_on_close). Stop beyond the
+// far edge of the triggering gap zone; target = source day's POC (fallback to
+// the R multiple when the POC is on the wrong side of entry) or a fixed R.
+
+if rejUpAny and enableLongs and strategy.position_size == 0 and not na(trigUpLo)
+    stopP = trigUpLo - close * stopBufPct / 100.0
+    risk  = close - stopP
+    rTgt  = close + rrMult * risk
+    tgtP  = tgtMode == "Source day POC" and not na(trigUpPoc) and trigUpPoc > close ? trigUpPoc : rTgt
+    if risk > 0
+        strategy.entry("Long", strategy.long)
+        strategy.exit("Long exit", "Long", stop=stopP, limit=tgtP)
+
+if rejDnAny and enableShorts and strategy.position_size == 0 and not na(trigDnHi)
+    stopP = trigDnHi + close * stopBufPct / 100.0
+    risk  = stopP - close
+    rTgt  = close - rrMult * risk
+    tgtP  = tgtMode == "Source day POC" and not na(trigDnPoc) and trigDnPoc < close ? trigDnPoc : rTgt
+    if risk > 0
+        strategy.entry("Short", strategy.short)
+        strategy.exit("Short exit", "Short", stop=stopP, limit=tgtP)
+
+if exitOpp
+    if rejDnAny and strategy.position_size > 0
+        strategy.close("Long", comment="opposite signal")
+    if rejUpAny and strategy.position_size < 0
+        strategy.close("Short", comment="opposite signal")
+
+// ─── DASHBOARD BOX ───────────────────────────────────────────────────────────
+
+cBull = #00ffbb
+cBear = #ff1100
+cNeut = #888888
+cLbl  = #aaaacc
+sz    = sizeFromInput(tblSize)
+
+var table tbl = na
+if barstate.islast and not modDash and not na(tbl)
+    table.delete(tbl)
+    tbl := na
+if barstate.islast and modDash
+    if na(tbl)
+        tbl := table.new(posFromInput(tblPos), 2, 9, bgcolor=color.new(#1a1a2e, 10), border_width=1, border_color=#333355, frame_color=#444477, frame_width=1)
+    table.cell(tbl, 0, 0, "TREND DASHBOARD", text_color=#8888cc, text_size=sz)
+    table.cell(tbl, 1, 0, "", text_color=#8888cc, text_size=sz)
+    table.cell(tbl, 0, 1, "65min Trend", text_color=cLbl, text_size=sz)
+    table.cell(tbl, 1, 1, tf65Bull ? "BULL" : tf65Bear ? "BEAR" : "NEUTRAL", text_color=tf65Bull ? cBull : tf65Bear ? cBear : cNeut, text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 0, 2, "15min Trend", text_color=cLbl, text_size=sz)
+    table.cell(tbl, 1, 2, tf15Bull ? "BULL" : tf15Bear ? "BEAR" : "NEUTRAL", text_color=tf15Bull ? cBull : tf15Bear ? cBear : cNeut, text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 0, 3, "5min Trend", text_color=cLbl, text_size=sz)
+    table.cell(tbl, 1, 3, tf5Bull ? "BULL" : tf5Bear ? "BEAR" : "NEUTRAL", text_color=tf5Bull ? cBull : tf5Bear ? cBear : cNeut, text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 0, 4, "Bias Aligned", text_color=cLbl, text_size=sz)
+    table.cell(tbl, 1, 4, str.tostring(tfBullCount) + "B / " + str.tostring(tfBearCount) + "S", text_color=tfBullCount >= 3 ? cBull : tfBearCount >= 3 ? cBear : #cccc00, text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 0, 8, "Setup Grade", text_color=cLbl, text_size=sz)
+    table.cell(tbl, 1, 8, gradeTxt, text_color=gradeCol, text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 0, 5, "VWAP Bias", text_color=cLbl, text_size=sz)
+    table.cell(tbl, 1, 5, vwapBullish ? "ABOVE" : "BELOW", text_color=vwapBullish ? cBull : cBear, text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 0, 6, "MACD Gate", text_color=cLbl, text_size=sz)
+    table.cell(tbl, 1, 6, macdStatus, text_color=macdStatusCol, text_size=sz, text_halign=text.align_center)
+    table.cell(tbl, 0, 7, "MACD Setup", text_color=cLbl, text_size=sz)
+    table.cell(tbl, 1, 7, macdSetup, text_color=macdSetupCol, text_size=sz, text_halign=text.align_center)
+
+// ─── STATUS BOX ──────────────────────────────────────────────────────────────
+
+var table st = na
+if barstate.islast and not (showStatus and modGaps) and not na(st)
+    table.delete(st)
+    st := na
+if barstate.islast and showStatus and modGaps
+    if na(st)
+        st := table.new(posFromInput(statusPos), 2, 6, bgcolor=color.new(#1a1a2e, 10), border_width=1, border_color=#333355, frame_color=#444477, frame_width=1)
+    nReg = array.size(azLo)
+    nDrawn = 0
+    if nReg > 0
+        for j = 0 to nReg - 1
+            if array.get(azDrawn, j)
+                nDrawn += 1
+    // Coupons remaining on the drawn level nearest to current price.
+    nearTxt = "—"
+    if nDrawn > 0
+        bestJ = -1
+        bestD = 1.0e20
+        for j = 0 to nReg - 1
+            if array.get(azDrawn, j)
+                mid = (array.get(azLo, j) + array.get(azHi, j)) / 2.0
+                d = math.abs(close - mid)
+                if d < bestD
+                    bestD := d
+                    bestJ := j
+        if bestJ != -1
+            nearTxt := str.tostring(array.get(azUses, bestJ)) + " of " + str.tostring(couponsPer)
+    table.cell(st, 0, 0, "TSE Suite", text_color=#ff5030, text_size=size.small)
+    table.cell(st, 1, 0, "", text_size=size.small)
+    table.cell(st, 0, 1, "Registry levels", text_color=#aaaacc, text_size=size.small)
+    table.cell(st, 1, 1, str.tostring(nReg), text_color=#ffffff, text_size=size.small, text_halign=text.align_center)
+    table.cell(st, 0, 2, "Drawn today", text_color=#aaaacc, text_size=size.small)
+    table.cell(st, 1, 2, str.tostring(nDrawn), text_color=nDrawn > 0 ? #00ffbb : #ff1100, text_size=size.small, text_halign=text.align_center)
+    table.cell(st, 0, 3, "Nearest level coupons", text_color=#aaaacc, text_size=size.small)
+    table.cell(st, 1, 3, nearTxt, text_color=#ffffff, text_size=size.small, text_halign=text.align_center)
+    table.cell(st, 0, 4, "Lines drawn", text_color=#aaaacc, text_size=size.small)
+    table.cell(st, 1, 4, str.tostring(array.size(drawnGapLines)), text_color=#ffffff, text_size=size.small, text_halign=text.align_center)
+    table.cell(st, 0, 5, "1-min feed", text_color=#aaaacc, text_size=size.small)
+    table.cell(st, 1, 5, nSub > 0 ? "OK" : "no data", text_color=nSub > 0 ? #00ffbb : #ff1100, text_size=size.small, text_halign=text.align_center)
