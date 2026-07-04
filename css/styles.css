@@ -799,3 +799,43 @@ input[type="range"].explode::-moz-range-thumb {
   .photo-grid figure { grid-column: auto !important; }
   .photo-grid img, .photo-grid.tall img { height: 240px; }
 }
+
+/* ---------- Video embeds ---------- */
+.video-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 22px;
+}
+.video-card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.video-frame {
+  position: relative;
+  padding-top: 56.25%;
+  background: #000;
+}
+.video-frame iframe {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+}
+.video-card figcaption {
+  padding: 14px 18px;
+}
+.video-card figcaption b {
+  display: block;
+  font-family: var(--font-head);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-size: 1.05rem;
+}
+.video-card figcaption span {
+  font-size: 0.85rem;
+  color: var(--muted);
+}
