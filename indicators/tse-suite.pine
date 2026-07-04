@@ -501,8 +501,12 @@ else
 // ─── MODULE 3: TREND DASHBOARD CALCULATIONS ──────────────────────────────────
 // (Always computed — the signal gate uses these even if the box is hidden.)
 
-hma65 = request.security(syminfo.tickerid, "65", hma(close, hma65Len), barmerge.gaps_off, barmerge.lookahead_on)
-hma15 = request.security(syminfo.tickerid, "15", hma(close, hma15Len), barmerge.gaps_off, barmerge.lookahead_on)
+// HTF values use the last COMPLETED higher-timeframe bar ([1] + lookahead):
+// the classic non-repainting form. Historical bars see exactly what was
+// known live at that moment, so past triangles can be trusted. Trade-off:
+// a trend flip registers when the HTF bar closes, not mid-bar.
+hma65 = request.security(syminfo.tickerid, "65", hma(close, hma65Len)[1], barmerge.gaps_off, barmerge.lookahead_on)
+hma15 = request.security(syminfo.tickerid, "15", hma(close, hma15Len)[1], barmerge.gaps_off, barmerge.lookahead_on)
 hma5  = hma(close, hma5Len)
 
 tf65Bull = close > hma65
@@ -555,7 +559,9 @@ shortConf = (not reqTrend or tfBearCount == 3) and (not reqVwap or not vwapBulli
 
 bool rejUp = false
 bool rejDn = false
-if modGaps and array.size(azLo) > 0
+// barstate.isconfirmed: signals and coupons commit only on the bar CLOSE
+// (rule 7) — no mid-bar triangles that appear and then retract.
+if modGaps and barstate.isconfirmed and array.size(azLo) > 0
     for j = 0 to array.size(azLo) - 1
         if array.get(azDrawn, j) and array.get(azUses, j) > 0
             zL = array.get(azLo, j)
@@ -567,7 +573,7 @@ if modGaps and array.size(azLo) > 0
             if hitDn and shortConf
                 rejDn := true
             spend = couponMode == "Any rejection" ? (hitUp or hitDn) : ((hitUp and longConf) or (hitDn and shortConf))
-            if spend and barstate.isconfirmed
+            if spend
                 array.set(azUses, j, array.get(azUses, j) - 1)
 
 plotshape(showSignals ? rejUp : false, "Gap rejection (long)", shape.triangleup, location.belowbar, color=#00ffbb, size=size.tiny)
