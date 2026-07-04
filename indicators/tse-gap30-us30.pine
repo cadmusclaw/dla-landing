@@ -12,15 +12,23 @@
 //  • FIX: runtime crash "Index N is out of bounds" in the walk-back day
 //    selection. Pine `for` loops count DOWNWARD when start > end, so
 //    `for d = lastN to nStored - 1` with lastN > nStored - 1 read past the
-//    end of the day arrays. On 24/7 symbols (BTC) price almost always sits
-//    inside a recent day's range so the loop never ran; on US30, session
-//    gaps and holiday closes leave price outside every stored range and the
-//    loop fired, halting the script. Now guarded.
+//    end of the day arrays. Now guarded.
 //  • NEW: optional fallback (on by default) — if price gaps outside every
 //    stored day's range, draw the most recent completed day's gaps instead
 //    of drawing nothing. Recommended for indices/futures/CFDs.
+//
+// v1.2 — Transparency / diagnostics:
+//  • NEW: each gap line carries a small label naming its source session
+//    (the date the session ENDED, e.g. "Jul 2" for the Jul 1 18:00 →
+//    Jul 2 18:00 session).
+//  • NEW: status box row "Drawn from" reporting exactly which stored day(s)
+//    the current lines came from, and whether the fallback fired.
+//  • NEW: optional "Show source profile" debug rendering — draws the
+//    selected day's stored volume profile at the session start, with bins
+//    color-coded: red = meets gap threshold, orange = meets LVN threshold,
+//    gray = normal. Lets you verify the engine's profile against the chart.
 // ═════════════════════════════════════════════════════════════════════════════
-indicator("TSE Gap30", shorttitle="TSE Gap30", overlay=true, max_lines_count=500, max_labels_count=100)
+indicator("TSE Gap30", shorttitle="TSE Gap30", overlay=true, max_lines_count=500, max_labels_count=200, max_boxes_count=500)
 
 plot(na, title="dummy", display=display.none)
 
@@ -39,7 +47,7 @@ lvnPct     = input.float(30, "LVN zone threshold (% of POC)", 5, 60, 1, group=gr
 lvnMinBins = input.int(3, "Min LVN zone size (bins)", 2, 30, group=grpGap)
 gapPct     = input.float(8, "Gap threshold (% of POC)", 1, 30, 1, group=grpGap)
 gapMinBins = input.int(1, "Min gap size (bins)", 1, 15, group=grpGap)
-tailOnly   = input.bool(true, "Only gaps outside the value area", group=grpGap)
+tailOnly   = input.bool(true, "Only gaps outside the value area", group=grpGap, tooltip="ON = ignore low-volume zones inside the value area (mid-profile). Turn OFF if you also trade gaps in the middle of the profile.")
 promEnable = input.bool(false, "Require flanking HVN peaks (prominence)", group=grpGap)
 promBoth   = input.bool(false, "Require peaks on BOTH sides", group=grpGap)
 promRatio  = input.float(2.0, "Prominence ratio (peak / valley)", 1.2, 6.0, 0.1, group=grpGap)
@@ -53,10 +61,13 @@ showGapLines = input.bool(true, "Show gap lines", group=grpDisp)
 colGapLine   = input.color(#ff5030, "Gap line color", group=grpDisp)
 gapStyleIn   = input.string("Solid", "Gap line style", options=["Solid", "Dashed", "Dotted"], group=grpDisp)
 gapWidth     = input.int(2, "Gap line width", 1, 4, group=grpDisp)
+showSrcLabels = input.bool(true, "Label each line with its source day", group=grpDisp)
 
-grpDbg = "Status Box"
+grpDbg = "Status / Debug"
 showStatus = input.bool(true, "Show status box", group=grpDbg, tooltip="Small panel reporting what the engine sees. Turn off for a clean chart.")
 statusPos  = input.string("Bottom Right", "Status box position", options=["Top Right", "Top Left", "Bottom Right", "Bottom Left", "Middle Right"], group=grpDbg)
+showDayProfile = input.bool(false, "Show source profile (debug)", group=grpDbg, tooltip="Draws the selected day's stored volume profile at the session start. Red bins = meet the gap threshold, orange = meet the LVN threshold, gray = normal volume.")
+profWidth  = input.int(30, "Debug profile width (bars)", 10, 100, group=grpDbg)
 
 // ─── CONSTANTS ───────────────────────────────────────────────────────────────
 
@@ -83,11 +94,20 @@ var bool skipFirst = true
 
 // Per-day storage (newest at index 0).
 var matrix<float> dayGaps = matrix.new<float>(0, MAXGAPS, na)
+var matrix<float> dayBins = matrix.new<float>(0, profileRows, 0.0)
 var array<float>  dayHi   = array.new_float()
 var array<float>  dayLo   = array.new_float()
 var array<int>    dayCnt  = array.new_int()
+var array<int>    dayAnchor = array.new_int()
 
-var array<line> drawnGapLines = array.new_line()
+var array<line>  drawnGapLines  = array.new_line()
+var array<label> drawnGapLabels = array.new_label()
+var array<box>   drawnProfBoxes = array.new_box()
+var array<string> srcInfo = array.new_string(1, "none")   // which day(s) current lines came from
+
+// Human tag for a stored day: the date its session ENDED (anchor + 24h).
+dayTag(int d) =>
+    str.format_time(array.get(dayAnchor, d) + 86400000, "MMM d", sesTz)
 
 // ─── GAP DETECTION ───────────────────────────────────────────────────────────
 // Returns an array of gap price levels for one finished profile.
@@ -186,14 +206,18 @@ computeAndStoreGaps() =>
                 array.set(row, i, array.get(gaps, i))
 
         matrix.add_row(dayGaps, 0, row)
+        matrix.add_row(dayBins, 0, bins)
         array.unshift(dayHi, pHi)
         array.unshift(dayLo, pLo)
         array.unshift(dayCnt, cnt)
+        array.unshift(dayAnchor, curAnchor)
         while array.size(dayHi) > MAXDAYS
             array.pop(dayHi)
             array.pop(dayLo)
             array.pop(dayCnt)
+            array.pop(dayAnchor)
             matrix.remove_row(dayGaps, matrix.rows(dayGaps) - 1)
+            matrix.remove_row(dayBins, matrix.rows(dayBins) - 1)
     true
 
 // ─── DRAW one stored day's gaps as static, right-extended lines ──────────────
@@ -202,24 +226,57 @@ drawDayGaps(int d) =>
     cnt = array.get(dayCnt, d)
     if cnt > 0
         row = matrix.row(dayGaps, d)
+        tag = dayTag(d)
         for i = 0 to cnt - 1
             lvl = array.get(row, i)
             if not na(lvl)
                 array.push(drawnGapLines, line.new(bar_index, lvl, bar_index + 1, lvl, xloc.bar_index, extend.right, colGapLine, gapStyle, gapWidth))
+                if showSrcLabels
+                    array.push(drawnGapLabels, label.new(bar_index, lvl, tag, xloc.bar_index, yloc.price, color.new(color.black, 100), label.style_none, textcolor=colGapLine, size=size.tiny))
+    true
+
+// ─── DRAW one stored day's profile at the session start (debug) ──────────────
+
+drawDayProfile(int d) =>
+    hi = array.get(dayHi, d)
+    lo = array.get(dayLo, d)
+    bStep = (hi - lo) <= 0 ? syminfo.mintick : (hi - lo) / profileRows
+    rowB = matrix.row(dayBins, d)
+    pocV = array.max(rowB)
+    if pocV > 0
+        for i = 0 to profileRows - 1
+            v = array.get(rowB, i)
+            w = math.max(1, math.round(profWidth * v / pocV))
+            rel = v / pocV
+            col = rel <= gapPct / 100.0 ? color.new(#ff5030, 45) : rel <= lvnPct / 100.0 ? color.new(#ffb020, 60) : color.new(#7a7a9a, 72)
+            array.push(drawnProfBoxes, box.new(bar_index, lo + (i + 1) * bStep, bar_index + w, lo + i * bStep, border_color=color.new(color.black, 100), bgcolor=col))
     true
 
 // ─── SELECT relevant day(s) for current price and (re)draw ───────────────────
 
+drawDay(int d) =>
+    drawDayGaps(d)
+    if showDayProfile
+        drawDayProfile(d)
+    true
+
 selectAndDrawGaps(float price) =>
     while array.size(drawnGapLines) > 0
         line.delete(array.pop(drawnGapLines))
+    while array.size(drawnGapLabels) > 0
+        label.delete(array.pop(drawnGapLabels))
+    while array.size(drawnProfBoxes) > 0
+        box.delete(array.pop(drawnProfBoxes))
+    array.set(srcInfo, 0, "none")
     nStored = math.min(array.size(dayHi), array.size(dayLo), array.size(dayCnt), matrix.rows(dayGaps))
     if showGapLines and nStored > 0
         drew  = false
+        txt   = ""
         lastN = math.min(daysConsider, nStored)
         for d = 0 to lastN - 1
             if price <= array.get(dayHi, d) and price >= array.get(dayLo, d)
-                drawDayGaps(d)
+                drawDay(d)
+                txt := txt == "" ? dayTag(d) : txt + ", " + dayTag(d)
                 drew := true
         // Walk-back: only when older days actually exist. Pine `for` loops
         // count DOWNWARD when start > end, so an unguarded
@@ -228,13 +285,16 @@ selectAndDrawGaps(float price) =>
         if not drew and lastN <= nStored - 1
             for d = lastN to nStored - 1
                 if price <= array.get(dayHi, d) and price >= array.get(dayLo, d)
-                    drawDayGaps(d)
+                    drawDay(d)
+                    txt := dayTag(d) + " (walk-back)"
                     drew := true
                     break
         // Non-24/7 fallback: price gapped outside every stored day's range
         // (common at US30 opens). Draw the most recent completed day anyway.
         if not drew and fallbackRecent
-            drawDayGaps(0)
+            drawDay(0)
+            txt := dayTag(0) + " (FALLBACK)"
+        array.set(srcInfo, 0, txt == "" ? "none" : txt)
     true
 
 // ─── ACCUMULATE 1-min feed, detect session boundaries, store + draw ──────────
@@ -299,21 +359,24 @@ else
 statusPosition = statusPos == "Top Right" ? position.top_right : statusPos == "Top Left" ? position.top_left : statusPos == "Bottom Left" ? position.bottom_left : statusPos == "Middle Right" ? position.middle_right : position.bottom_right
 
 if barstate.islast and showStatus
-    var table st = table.new(statusPosition, 2, 5, bgcolor=color.new(#1a1a2e, 10), border_width=1, border_color=#333355, frame_color=#444477, frame_width=1)
+    var table st = table.new(statusPosition, 2, 6, bgcolor=color.new(#1a1a2e, 10), border_width=1, border_color=#333355, frame_color=#444477, frame_width=1)
     nStored = array.size(dayHi)
     contains = "none"
     if nStored > 0
         for d = 0 to nStored - 1
             if close <= array.get(dayHi, d) and close >= array.get(dayLo, d)
-                contains := "day " + str.tostring(d)
+                contains := dayTag(d)
                 break
     table.cell(st, 0, 0, "TSE Gap30", text_color=#ff5030, text_size=size.small)
     table.cell(st, 1, 0, "", text_size=size.small)
     table.cell(st, 0, 1, "Stored days", text_color=#aaaacc, text_size=size.small)
     table.cell(st, 1, 1, str.tostring(nStored), text_color=#ffffff, text_size=size.small, text_halign=text.align_center)
-    table.cell(st, 0, 2, "Active day", text_color=#aaaacc, text_size=size.small)
+    table.cell(st, 0, 2, "Price inside", text_color=#aaaacc, text_size=size.small)
     table.cell(st, 1, 2, contains, text_color=contains == "none" ? #ff1100 : #00ffbb, text_size=size.small, text_halign=text.align_center)
-    table.cell(st, 0, 3, "Lines drawn", text_color=#aaaacc, text_size=size.small)
-    table.cell(st, 1, 3, str.tostring(array.size(drawnGapLines)), text_color=#ffffff, text_size=size.small, text_halign=text.align_center)
-    table.cell(st, 0, 4, "1-min feed", text_color=#aaaacc, text_size=size.small)
-    table.cell(st, 1, 4, nSub > 0 ? "OK" : "no data", text_color=nSub > 0 ? #00ffbb : #ff1100, text_size=size.small, text_halign=text.align_center)
+    table.cell(st, 0, 3, "Drawn from", text_color=#aaaacc, text_size=size.small)
+    drawnFrom = array.get(srcInfo, 0)
+    table.cell(st, 1, 3, drawnFrom, text_color=drawnFrom == "none" ? #ff1100 : #00ffbb, text_size=size.small, text_halign=text.align_center)
+    table.cell(st, 0, 4, "Lines drawn", text_color=#aaaacc, text_size=size.small)
+    table.cell(st, 1, 4, str.tostring(array.size(drawnGapLines)), text_color=#ffffff, text_size=size.small, text_halign=text.align_center)
+    table.cell(st, 0, 5, "1-min feed", text_color=#aaaacc, text_size=size.small)
+    table.cell(st, 1, 5, nSub > 0 ? "OK" : "no data", text_color=nSub > 0 ? #00ffbb : #ff1100, text_size=size.small, text_halign=text.align_center)
