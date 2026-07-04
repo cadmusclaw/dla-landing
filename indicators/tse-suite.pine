@@ -38,9 +38,9 @@ modDash = input.bool(true, "Trend Dashboard", group=grpMod)
 // ─── SESSION / PROFILE (shared engine) ───────────────────────────────────────
 
 grpSes = "Session / Profile"
-startHr  = input.int(18, "Session Start Hour", 0, 23, group=grpSes, tooltip="Hour the session begins, in the timezone below (24h clock).")
+startHr  = input.int(9, "Session Start Hour", 0, 23, group=grpSes, tooltip="Hour the session begins, in the timezone below (24h clock). Default 9 + Asia/Tokyo = Tokyo session open (~8pm ET summer / 7pm ET winter).")
 startMin = input.int(0,  "Session Start Minute", 0, 59, group=grpSes)
-sesTz    = input.string("America/New_York", "Session Timezone", group=grpSes, tooltip="IANA timezone name, e.g. America/New_York. DST handled automatically.")
+sesTz    = input.string("Asia/Tokyo", "Session Timezone", group=grpSes, tooltip="IANA timezone name. Keep the anchor in the market's OWN timezone (Asia/Tokyo has no DST) so the boundary never drifts when US clocks change.")
 profileRows = input.int(100, "Profile Rows (bins)", 20, 300, group=grpSes, tooltip="More rows = finer price levels, heavier drawing.")
 vaPct       = input.float(68, "Value Area %", 50, 90, 1, group=grpSes, tooltip="Percentage of session volume that defines the value area. You use 68%.") / 100.0
 ltfFeed     = input.timeframe("1", "Volume Feed Timeframe", group=grpSes, tooltip="The profile is built from this fixed feed, so it is identical on any chart timeframe. 1-min recommended.")
