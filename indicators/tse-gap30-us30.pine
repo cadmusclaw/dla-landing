@@ -10,23 +10,25 @@
 //
 // v1.1 — Non-24/7 market fix (US30):
 //  • FIX: runtime crash "Index N is out of bounds" in the walk-back day
-//    selection. Pine `for` loops count DOWNWARD when start > end, so
-//    `for d = lastN to nStored - 1` with lastN > nStored - 1 read past the
-//    end of the day arrays. Now guarded.
-//  • NEW: optional fallback (on by default) — if price gaps outside every
-//    stored day's range, draw the most recent completed day's gaps instead
-//    of drawing nothing. Recommended for indices/futures/CFDs.
+//    selection (Pine `for` loops count DOWNWARD when start > end). Guarded.
+//  • NEW: optional fallback — if price gaps outside every stored day's range,
+//    draw the most recent completed day's gaps instead of nothing.
 //
 // v1.2 — Transparency / diagnostics:
-//  • NEW: each gap line carries a small label naming its source session
-//    (the date the session ENDED, e.g. "Jul 2" for the Jul 1 18:00 →
-//    Jul 2 18:00 session).
-//  • NEW: status box row "Drawn from" reporting exactly which stored day(s)
-//    the current lines came from, and whether the fallback fired.
-//  • NEW: optional "Show source profile" debug rendering — draws the
-//    selected day's stored volume profile at the session start, with bins
-//    color-coded: red = meets gap threshold, orange = meets LVN threshold,
-//    gray = normal. Lets you verify the engine's profile against the chart.
+//  • NEW: source-day label on each gap line, "Drawn from" status row, and
+//    optional debug rendering of the selected day's stored profile.
+//
+// v1.3 — Profile accuracy + interior gap detection:
+//  • FIX: each 1-min bar's volume was binned entirely at its CLOSE price, so
+//    fast moves punched artificial zero-volume holes and shifted gap zones.
+//    Volume is now distributed across the bar's full high–low range, and the
+//    day's range comes from true highs/lows instead of closes.
+//  • CHANGE: detection now targets INTERIOR gaps between volume clusters.
+//    Defaults: value-area gaps included (tail-only OFF), flanking HVN peaks
+//    required on BOTH sides (prominence ON). The always-thin bins at the
+//    day's range extremes no longer qualify as gaps.
+//  • NEW: gap zones stored with their top/bottom bounds. "Gap line placement"
+//    draws either both zone edges (default) or a single center line.
 // ═════════════════════════════════════════════════════════════════════════════
 indicator("TSE Gap30", shorttitle="TSE Gap30", overlay=true, max_lines_count=500, max_labels_count=200, max_boxes_count=500)
 
@@ -47,9 +49,9 @@ lvnPct     = input.float(30, "LVN zone threshold (% of POC)", 5, 60, 1, group=gr
 lvnMinBins = input.int(3, "Min LVN zone size (bins)", 2, 30, group=grpGap)
 gapPct     = input.float(8, "Gap threshold (% of POC)", 1, 30, 1, group=grpGap)
 gapMinBins = input.int(1, "Min gap size (bins)", 1, 15, group=grpGap)
-tailOnly   = input.bool(true, "Only gaps outside the value area", group=grpGap, tooltip="ON = ignore low-volume zones inside the value area (mid-profile). Turn OFF if you also trade gaps in the middle of the profile.")
-promEnable = input.bool(false, "Require flanking HVN peaks (prominence)", group=grpGap)
-promBoth   = input.bool(false, "Require peaks on BOTH sides", group=grpGap)
+tailOnly   = input.bool(false, "Only gaps outside the value area", group=grpGap, tooltip="ON = ignore low-volume zones inside the value area. OFF (default) = interior gaps between volume clusters are detected too.")
+promEnable = input.bool(true, "Require flanking HVN peaks (prominence)", group=grpGap, tooltip="A gap must sit BETWEEN volume clusters. Filters out the always-thin bins at the day's range extremes.")
+promBoth   = input.bool(true, "Require peaks on BOTH sides", group=grpGap)
 promRatio  = input.float(2.0, "Prominence ratio (peak / valley)", 1.2, 6.0, 0.1, group=grpGap)
 
 grpDay = "Day Selection"
@@ -58,6 +60,7 @@ fallbackRecent = input.bool(true, "If no day contains price, draw most recent da
 
 grpDisp = "Display"
 showGapLines = input.bool(true, "Show gap lines", group=grpDisp)
+gapPlace     = input.string("Zone edges", "Gap line placement", options=["Zone edges", "Zone center"], group=grpDisp, tooltip="Zone edges = two lines bounding each gap zone. Zone center = one line at the middle.")
 colGapLine   = input.color(#ff5030, "Gap line color", group=grpDisp)
 gapStyleIn   = input.string("Solid", "Gap line style", options=["Solid", "Dashed", "Dotted"], group=grpDisp)
 gapWidth     = input.int(2, "Gap line width", 1, 4, group=grpDisp)
@@ -86,15 +89,17 @@ sessAnchorOf(int t) =>
 
 // ─── STATE ───────────────────────────────────────────────────────────────────
 
-var array<float> rawPrice = array.new_float()
-var array<float> rawVol   = array.new_float()
+var array<float> rawHi  = array.new_float()
+var array<float> rawLo  = array.new_float()
+var array<float> rawVol = array.new_float()
 var int  curAnchor = na
 var int  sStartBar = na
 var bool skipFirst = true
 
-// Per-day storage (newest at index 0).
-var matrix<float> dayGaps = matrix.new<float>(0, MAXGAPS, na)
-var matrix<float> dayBins = matrix.new<float>(0, profileRows, 0.0)
+// Per-day storage (newest at index 0). Gap zones keep their top/bottom bounds.
+var matrix<float> dayGapLo = matrix.new<float>(0, MAXGAPS, na)
+var matrix<float> dayGapHi = matrix.new<float>(0, MAXGAPS, na)
+var matrix<float> dayBins  = matrix.new<float>(0, profileRows, 0.0)
 var array<float>  dayHi   = array.new_float()
 var array<float>  dayLo   = array.new_float()
 var array<int>    dayCnt  = array.new_int()
@@ -110,10 +115,11 @@ dayTag(int d) =>
     str.format_time(array.get(dayAnchor, d) + 86400000, "MMM d", sesTz)
 
 // ─── GAP DETECTION ───────────────────────────────────────────────────────────
-// Returns an array of gap price levels for one finished profile.
+// Returns the bottom/top price bounds of each gap zone in one finished profile.
 
 detectGaps(array<float> bins, float pLo, float bStep, int pocI, int vLo, int vHi, float pocV) =>
-    out = array.new_float()
+    outLo = array.new_float()
+    outHi = array.new_float()
     if pocV > 0
         lvnThr = lvnPct / 100.0
         gapThr = gapPct / 100.0
@@ -148,28 +154,37 @@ detectGaps(array<float> bins, float pLo, float bStep, int pocI, int vLo, int vHi
                                     okL = valley <= 0 ? peakL > 0 : peakL >= promRatio * valley
                                     okR = valley <= 0 ? peakR > 0 : peakR >= promRatio * valley
                                     pass := promBoth ? (okL and okR) : (gj < pocI ? okR : okL)
-                                if pass and array.size(out) < MAXGAPS
-                                    array.push(out, pLo + ((gi + gj) / 2.0 + 0.5) * bStep)
+                                if pass and array.size(outLo) < MAXGAPS
+                                    array.push(outLo, pLo + gi * bStep)
+                                    array.push(outHi, pLo + (gj + 1) * bStep)
                             gi := gj + 1
                         else
                             gi += 1
                 zi := zj + 1
             else
                 zi += 1
-    out
+    [outLo, outHi]
 
 // ─── COMPUTE + STORE one completed day's profile/gaps (no drawing) ────────────
 
 computeAndStoreGaps() =>
-    n = array.size(rawPrice)
+    n = array.size(rawVol)
     if n > 0
-        pHi = array.max(rawPrice)
-        pLo = array.min(rawPrice)
+        pHi = array.max(rawHi)
+        pLo = array.min(rawLo)
         bStep = (pHi - pLo) <= 0 ? syminfo.mintick : (pHi - pLo) / profileRows
         bins = array.new_float(profileRows, 0.0)
+        // Distribute each feed bar's volume evenly across the bins its
+        // high–low range covers (v1.3 fix: close-only binning punched
+        // artificial holes in fast moves).
         for i = 0 to n - 1
-            bi = math.min(math.max(math.floor((array.get(rawPrice, i) - pLo) / bStep), 0), profileRows - 1)
-            array.set(bins, bi, array.get(bins, bi) + array.get(rawVol, i))
+            bh = array.get(rawHi, i)
+            bl = array.get(rawLo, i)
+            b0 = math.min(math.max(math.floor((bl - pLo) / bStep), 0), profileRows - 1)
+            b1 = math.min(math.max(math.floor((bh - pLo) / bStep), 0), profileRows - 1)
+            vPer = array.get(rawVol, i) / (b1 - b0 + 1)
+            for b = b0 to b1
+                array.set(bins, b, array.get(bins, b) + vPer)
 
         pocI = 0
         pocV = 0.0
@@ -198,14 +213,17 @@ computeAndStoreGaps() =>
                 vHi += 1
                 vLo -= 1
 
-        gaps = detectGaps(bins, pLo, bStep, pocI, vLo, vHi, pocV)
-        cnt  = math.min(array.size(gaps), MAXGAPS)
-        row  = array.new_float(MAXGAPS, na)
+        [gapsLo, gapsHi] = detectGaps(bins, pLo, bStep, pocI, vLo, vHi, pocV)
+        cnt   = math.min(array.size(gapsLo), MAXGAPS)
+        rowLo = array.new_float(MAXGAPS, na)
+        rowHi = array.new_float(MAXGAPS, na)
         if cnt > 0
             for i = 0 to cnt - 1
-                array.set(row, i, array.get(gaps, i))
+                array.set(rowLo, i, array.get(gapsLo, i))
+                array.set(rowHi, i, array.get(gapsHi, i))
 
-        matrix.add_row(dayGaps, 0, row)
+        matrix.add_row(dayGapLo, 0, rowLo)
+        matrix.add_row(dayGapHi, 0, rowHi)
         matrix.add_row(dayBins, 0, bins)
         array.unshift(dayHi, pHi)
         array.unshift(dayLo, pLo)
@@ -216,7 +234,8 @@ computeAndStoreGaps() =>
             array.pop(dayLo)
             array.pop(dayCnt)
             array.pop(dayAnchor)
-            matrix.remove_row(dayGaps, matrix.rows(dayGaps) - 1)
+            matrix.remove_row(dayGapLo, matrix.rows(dayGapLo) - 1)
+            matrix.remove_row(dayGapHi, matrix.rows(dayGapHi) - 1)
             matrix.remove_row(dayBins, matrix.rows(dayBins) - 1)
     true
 
@@ -225,14 +244,23 @@ computeAndStoreGaps() =>
 drawDayGaps(int d) =>
     cnt = array.get(dayCnt, d)
     if cnt > 0
-        row = matrix.row(dayGaps, d)
+        rLo = matrix.row(dayGapLo, d)
+        rHi = matrix.row(dayGapHi, d)
         tag = dayTag(d)
         for i = 0 to cnt - 1
-            lvl = array.get(row, i)
-            if not na(lvl)
-                array.push(drawnGapLines, line.new(bar_index, lvl, bar_index + 1, lvl, xloc.bar_index, extend.right, colGapLine, gapStyle, gapWidth))
-                if showSrcLabels
-                    array.push(drawnGapLabels, label.new(bar_index, lvl, tag, xloc.bar_index, yloc.price, color.new(color.black, 100), label.style_none, textcolor=colGapLine, size=size.tiny))
+            zLo = array.get(rLo, i)
+            zHi = array.get(rHi, i)
+            if not na(zLo) and not na(zHi)
+                if gapPlace == "Zone center"
+                    mid = (zLo + zHi) / 2.0
+                    array.push(drawnGapLines, line.new(bar_index, mid, bar_index + 1, mid, xloc.bar_index, extend.right, colGapLine, gapStyle, gapWidth))
+                    if showSrcLabels
+                        array.push(drawnGapLabels, label.new(bar_index, mid, tag, xloc.bar_index, yloc.price, color.new(color.black, 100), label.style_none, textcolor=colGapLine, size=size.tiny))
+                else
+                    array.push(drawnGapLines, line.new(bar_index, zLo, bar_index + 1, zLo, xloc.bar_index, extend.right, colGapLine, gapStyle, gapWidth))
+                    array.push(drawnGapLines, line.new(bar_index, zHi, bar_index + 1, zHi, xloc.bar_index, extend.right, colGapLine, gapStyle, gapWidth))
+                    if showSrcLabels
+                        array.push(drawnGapLabels, label.new(bar_index, zHi, tag, xloc.bar_index, yloc.price, color.new(color.black, 100), label.style_none, textcolor=colGapLine, size=size.tiny))
     true
 
 // ─── DRAW one stored day's profile at the session start (debug) ──────────────
@@ -268,7 +296,7 @@ selectAndDrawGaps(float price) =>
     while array.size(drawnProfBoxes) > 0
         box.delete(array.pop(drawnProfBoxes))
     array.set(srcInfo, 0, "none")
-    nStored = math.min(array.size(dayHi), array.size(dayLo), array.size(dayCnt), matrix.rows(dayGaps))
+    nStored = math.min(array.size(dayHi), array.size(dayLo), array.size(dayCnt), matrix.rows(dayGapLo))
     if showGapLines and nStored > 0
         drew  = false
         txt   = ""
@@ -299,12 +327,13 @@ selectAndDrawGaps(float price) =>
 
 // ─── ACCUMULATE 1-min feed, detect session boundaries, store + draw ──────────
 
-ltfC = request.security_lower_tf(syminfo.tickerid, ltfFeed, close)
+ltfH = request.security_lower_tf(syminfo.tickerid, ltfFeed, high)
+ltfL = request.security_lower_tf(syminfo.tickerid, ltfFeed, low)
 ltfV = request.security_lower_tf(syminfo.tickerid, ltfFeed, volume)
 ltfT = request.security_lower_tf(syminfo.tickerid, ltfFeed, time)
 
 nSub = array.size(ltfT)
-if nSub > 0 and nSub == array.size(ltfC) and nSub == array.size(ltfV)
+if nSub > 0 and nSub == array.size(ltfH) and nSub == array.size(ltfL) and nSub == array.size(ltfV)
     saFirst = sessAnchorOf(array.get(ltfT, 0))
     saLast  = sessAnchorOf(array.get(ltfT, nSub - 1))
     if saFirst == saLast
@@ -312,14 +341,16 @@ if nSub > 0 and nSub == array.size(ltfC) and nSub == array.size(ltfV)
             if not na(curAnchor) and not skipFirst
                 computeAndStoreGaps()
             skipFirst := na(curAnchor) ? skipFirst : false
-            array.clear(rawPrice)
+            array.clear(rawHi)
+            array.clear(rawLo)
             array.clear(rawVol)
             curAnchor := saFirst
             sStartBar := bar_index
             selectAndDrawGaps(close)
         for i = 0 to nSub - 1
-            array.push(rawPrice, array.get(ltfC, i))
-            array.push(rawVol,   array.get(ltfV, i))
+            array.push(rawHi,  array.get(ltfH, i))
+            array.push(rawLo,  array.get(ltfL, i))
+            array.push(rawVol, array.get(ltfV, i))
     else
         for i = 0 to nSub - 1
             sa = sessAnchorOf(array.get(ltfT, i))
@@ -330,13 +361,15 @@ if nSub > 0 and nSub == array.size(ltfC) and nSub == array.size(ltfV)
                 if not skipFirst
                     computeAndStoreGaps()
                 skipFirst := false
-                array.clear(rawPrice)
+                array.clear(rawHi)
+                array.clear(rawLo)
                 array.clear(rawVol)
                 curAnchor := sa
                 sStartBar := bar_index
                 selectAndDrawGaps(close)
-            array.push(rawPrice, array.get(ltfC, i))
-            array.push(rawVol,   array.get(ltfV, i))
+            array.push(rawHi,  array.get(ltfH, i))
+            array.push(rawLo,  array.get(ltfL, i))
+            array.push(rawVol, array.get(ltfV, i))
 else
     sa = sessAnchorOf(time)
     if na(curAnchor)
@@ -346,13 +379,15 @@ else
         if not skipFirst
             computeAndStoreGaps()
         skipFirst := false
-        array.clear(rawPrice)
+        array.clear(rawHi)
+        array.clear(rawLo)
         array.clear(rawVol)
         curAnchor := sa
         sStartBar := bar_index
         selectAndDrawGaps(close)
-    array.push(rawPrice, hlc3)
-    array.push(rawVol,   volume)
+    array.push(rawHi,  high)
+    array.push(rawLo,  low)
+    array.push(rawVol, volume)
 
 // ─── STATUS BOX (toggleable, corner-anchored) ────────────────────────────────
 
