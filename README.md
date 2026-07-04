@@ -27,10 +27,10 @@ python3 -m http.server 8080
 
 ## Before launch — checklist
 
-1. **Quote form**: `contact.html` is wired for [Formspree](https://formspree.io). Create a free form pointed at contact@tootagroup.com and replace `YOUR_FORM_ID` in `contact.html`. Until then the form won't submit (email/phone links still work).
-2. **Verify registration data**: CAGE **93ST9**, establishment year, and address were taken from public listings. Add your **UEI and registered NAICS codes** to `government.html` when ready (currently listed as "available on request").
+1. **Quote form**: wire the form to Google so submissions email contact@tootagroup.com — full step-by-step instructions in `GOOGLE-FORM-SETUP.md`. Until then, submitting opens a pre-filled email (still functional).
+2. **Verify registration data**: CAGE **93ST9** and establishment year were taken from public listings — confirm before launch. NAICS codes are intentionally listed as "available on request" on the Government page.
 3. **Install video**: when you film the RunFlat install, drop the YouTube embed into the marked slot in `installation.html` (instructions are in an HTML comment there).
-4. **Photos**: the site currently uses custom SVG illustrations. Real photos of your warehouse, assemblies, and installs will make it even stronger — they can replace or sit alongside the illustrations.
+4. **Photos**: real facility photos are in `assets/img/` and placed throughout the site. Swap or add more anytime — keep them ~1600px wide, JPEG.
 
 ## Deploying (replacing the WordPress site)
 

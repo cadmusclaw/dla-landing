@@ -142,3 +142,50 @@
     update();
   });
 })();
+
+/* Quote form → Google Apps Script webhook (see GOOGLE-FORM-SETUP.md).
+   If no endpoint is configured yet, fall back to a pre-filled email. */
+(function () {
+  "use strict";
+  var form = document.getElementById("quote-form");
+  if (!form) return;
+  var endpoint = form.getAttribute("data-endpoint") || "";
+  var status = document.getElementById("quote-status");
+
+  form.addEventListener("submit", function (e) {
+    e.preventDefault();
+    var data = new FormData(form);
+
+    if (endpoint) {
+      var btn = form.querySelector('button[type="submit"]');
+      btn.disabled = true;
+      btn.textContent = "Sending…";
+      fetch(endpoint, { method: "POST", mode: "no-cors", body: data })
+        .then(function () {
+          form.reset();
+          status.textContent = "✓ Request sent — we'll get back to you within one business day.";
+          status.style.color = "#8fbf7f";
+        })
+        .catch(function () {
+          status.textContent = "Couldn't send right now — please email contact@tootagroup.com or call (848) 444-1195.";
+          status.style.color = "#c8563e";
+        })
+        .then(function () {
+          btn.disabled = false;
+          btn.textContent = "Send Request";
+        });
+    } else {
+      var body =
+        "Name: " + (data.get("name") || "") +
+        "\nOrganization: " + (data.get("organization") || "") +
+        "\nEmail: " + (data.get("email") || "") +
+        "\nPhone: " + (data.get("phone") || "") +
+        "\nInterest: " + (data.get("interest") || "") +
+        "\n\n" + (data.get("message") || "");
+      window.location.href = "mailto:contact@tootagroup.com" +
+        "?subject=" + encodeURIComponent("Quote Request — " + (data.get("name") || "Website")) +
+        "&body=" + encodeURIComponent(body);
+      status.textContent = "Opening your email app — or send directly to contact@tootagroup.com.";
+    }
+  });
+})();
