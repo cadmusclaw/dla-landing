@@ -34,12 +34,15 @@ python3 -m http.server 8080
 
 ## Deploying (replacing the WordPress site)
 
-Any static host works. Easiest options:
+A GitHub Actions workflow (`.github/workflows/deploy.yml`) is already included. To go live free on GitHub Pages:
 
-- **Cloudflare Pages / Netlify / Vercel** (free): connect this GitHub repo, every push auto-deploys.
-- **GitHub Pages** (free): repo Settings → Pages → deploy from branch.
+1. Merge this branch to `main`.
+2. In the GitHub repo: **Settings → Pages → Source → GitHub Actions** (one dropdown).
+3. Done — the site publishes at `https://cadmusclaw.github.io/dla-landing/` and republishes on every push to `main`.
 
-To move the domain: once deployed, point `tootaautogroup.com` (and/or `thetootagroup.com`) DNS at the new host per their instructions. Keep the WordPress site up until DNS switches over — zero downtime.
+Alternatively, **Cloudflare Pages / Netlify / Vercel** (also free): connect this repo and every push auto-deploys.
+
+To move the domain: once deployed, add `thetootagroup.com` (and/or `tootaautogroup.com`) as a custom domain in the host's settings and update the domain's DNS per their instructions. Keep the WordPress site up until DNS switches over — zero downtime.
 
 ## Notes
 
