@@ -29,6 +29,15 @@
 //    day's range extremes no longer qualify as gaps.
 //  • NEW: gap zones stored with their top/bottom bounds. "Gap line placement"
 //    draws either both zone edges (default) or a single center line.
+//
+// v1.4 — Strategy alignment (VP Gap Reversal):
+//  • Defaults per strategy spec: gaps OUTSIDE the 68% value area (tail-only
+//    back ON), with flanking-peak prominence kept ON so the always-thin bins
+//    at the day's range extremes still never qualify.
+//  • NEW: touch-rejection signals — a bar that comes into a drawn gap zone
+//    and closes back away from it prints a triangle and fires an alert
+//    ("Gap rejection LONG/SHORT"). Evaluate on bar close; combine with your
+//    trend/VWAP/MACD dashboard for confluence.
 // ═════════════════════════════════════════════════════════════════════════════
 indicator("TSE Gap30", shorttitle="TSE Gap30", overlay=true, max_lines_count=500, max_labels_count=200, max_boxes_count=500)
 
@@ -49,7 +58,7 @@ lvnPct     = input.float(30, "LVN zone threshold (% of POC)", 5, 60, 1, group=gr
 lvnMinBins = input.int(3, "Min LVN zone size (bins)", 2, 30, group=grpGap)
 gapPct     = input.float(8, "Gap threshold (% of POC)", 1, 30, 1, group=grpGap)
 gapMinBins = input.int(1, "Min gap size (bins)", 1, 15, group=grpGap)
-tailOnly   = input.bool(false, "Only gaps outside the value area", group=grpGap, tooltip="ON = ignore low-volume zones inside the value area. OFF (default) = interior gaps between volume clusters are detected too.")
+tailOnly   = input.bool(true, "Only gaps outside the value area", group=grpGap, tooltip="ON (default, per strategy spec) = only gaps outside the 68% value area. Turn OFF to also detect gaps inside the value area.")
 promEnable = input.bool(true, "Require flanking HVN peaks (prominence)", group=grpGap, tooltip="A gap must sit BETWEEN volume clusters. Filters out the always-thin bins at the day's range extremes.")
 promBoth   = input.bool(true, "Require peaks on BOTH sides", group=grpGap)
 promRatio  = input.float(2.0, "Prominence ratio (peak / valley)", 1.2, 6.0, 0.1, group=grpGap)
@@ -65,6 +74,9 @@ colGapLine   = input.color(#ff5030, "Gap line color", group=grpDisp)
 gapStyleIn   = input.string("Solid", "Gap line style", options=["Solid", "Dashed", "Dotted"], group=grpDisp)
 gapWidth     = input.int(2, "Gap line width", 1, 4, group=grpDisp)
 showSrcLabels = input.bool(true, "Label each line with its source day", group=grpDisp)
+
+grpSig = "Signals"
+showSignals = input.bool(true, "Show touch-rejection signals", group=grpSig, tooltip="Triangle when a bar comes into a drawn gap zone and closes back away from it (your entry rules 2–3). Confirm with your trend/VWAP/MACD dashboard before entering. Set alerts to fire Once Per Bar Close.")
 
 grpDbg = "Status / Debug"
 showStatus = input.bool(true, "Show status box", group=grpDbg, tooltip="Small panel reporting what the engine sees. Turn off for a clean chart.")
@@ -109,6 +121,8 @@ var array<line>  drawnGapLines  = array.new_line()
 var array<label> drawnGapLabels = array.new_label()
 var array<box>   drawnProfBoxes = array.new_box()
 var array<string> srcInfo = array.new_string(1, "none")   // which day(s) current lines came from
+var array<float> actZoneLo = array.new_float()            // active gap zones for signal checks
+var array<float> actZoneHi = array.new_float()
 
 // Human tag for a stored day: the date its session ENDED (anchor + 24h).
 dayTag(int d) =>
@@ -251,6 +265,8 @@ drawDayGaps(int d) =>
             zLo = array.get(rLo, i)
             zHi = array.get(rHi, i)
             if not na(zLo) and not na(zHi)
+                array.push(actZoneLo, zLo)
+                array.push(actZoneHi, zHi)
                 if gapPlace == "Zone center"
                     mid = (zLo + zHi) / 2.0
                     array.push(drawnGapLines, line.new(bar_index, mid, bar_index + 1, mid, xloc.bar_index, extend.right, colGapLine, gapStyle, gapWidth))
@@ -295,6 +311,8 @@ selectAndDrawGaps(float price) =>
         label.delete(array.pop(drawnGapLabels))
     while array.size(drawnProfBoxes) > 0
         box.delete(array.pop(drawnProfBoxes))
+    array.clear(actZoneLo)
+    array.clear(actZoneHi)
     array.set(srcInfo, 0, "none")
     nStored = math.min(array.size(dayHi), array.size(dayLo), array.size(dayCnt), matrix.rows(dayGapLo))
     if showGapLines and nStored > 0
@@ -388,6 +406,27 @@ else
     array.push(rawHi,  high)
     array.push(rawLo,  low)
     array.push(rawVol, volume)
+
+// ─── GAP TOUCH-REJECTION SIGNALS (strategy rules 2–3) ────────────────────────
+// Long: bar opens above a gap zone, trades into it, closes back above it.
+// Short: bar opens below a gap zone, trades into it, closes back below it.
+// Trend/VWAP/MACD confluence (rules 4–6) is confirmed externally.
+
+bool rejUp = false
+bool rejDn = false
+if showSignals and array.size(actZoneLo) > 0
+    for j = 0 to array.size(actZoneLo) - 1
+        zL = array.get(actZoneLo, j)
+        zH = array.get(actZoneHi, j)
+        if open > zH and low <= zH and close > zH
+            rejUp := true
+        if open < zL and high >= zL and close < zL
+            rejDn := true
+
+plotshape(rejUp, "Gap rejection (long)", shape.triangleup, location.belowbar, color=#00ffbb, size=size.tiny)
+plotshape(rejDn, "Gap rejection (short)", shape.triangledown, location.abovebar, color=#ff5030, size=size.tiny)
+alertcondition(rejUp, "Gap rejection LONG", "TSE Gap30: bullish rejection at volume gap zone")
+alertcondition(rejDn, "Gap rejection SHORT", "TSE Gap30: bearish rejection at volume gap zone")
 
 // ─── STATUS BOX (toggleable, corner-anchored) ────────────────────────────────
 
