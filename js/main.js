@@ -189,3 +189,64 @@
     }
   });
 })();
+
+/* Vibrancy layer: headline entrance, stat count-up, hero parallax */
+(function () {
+  "use strict";
+  var reduced = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  /* wrap hero headline words for staggered entrance */
+  var h1 = document.querySelector(".hero h1");
+  if (h1 && !reduced) {
+    var delay = 0;
+    Array.prototype.forEach.call(h1.childNodes, function (node) { void node; });
+    h1.innerHTML = h1.innerHTML.split(/(<br\s*\/?>|<span[^>]*>[\s\S]*?<\/span>)/g).map(function (part) {
+      if (!part) return "";
+      if (part.indexOf("<") === 0) return part;
+      return part.split(" ").map(function (w) {
+        if (!w.trim()) return w;
+        delay += 70;
+        return '<span class="w" style="animation-delay:' + delay + 'ms">' + w + "</span>";
+      }).join(" ");
+    }).join("");
+    /* the gold <span> rises as one unit */
+    var goldSpan = h1.querySelector("span.gold");
+    if (goldSpan) {
+      goldSpan.classList.add("w");
+      goldSpan.style.animationDelay = (delay + 140) + "ms";
+    }
+  }
+
+  /* count-up stats when scrolled into view */
+  var stats = document.querySelectorAll(".stat b");
+  if (stats.length && "IntersectionObserver" in window && !reduced) {
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (!e.isIntersecting) return;
+        io.unobserve(e.target);
+        var node = e.target.childNodes[0];
+        if (!node || node.nodeType !== 3) return;
+        var target = parseInt(node.textContent, 10);
+        if (!target) return;
+        var t0 = null;
+        function tick(ts) {
+          if (!t0) t0 = ts;
+          var p = Math.min((ts - t0) / 1100, 1);
+          node.textContent = Math.round(target * (1 - Math.pow(1 - p, 3)));
+          if (p < 1) requestAnimationFrame(tick);
+        }
+        requestAnimationFrame(tick);
+      });
+    }, { threshold: 0.4 });
+    stats.forEach(function (el) { io.observe(el); });
+  }
+
+  /* gentle parallax on the hero wheel */
+  var art = document.querySelector(".hero-art");
+  if (art && !reduced) {
+    window.addEventListener("scroll", function () {
+      var y = window.scrollY;
+      if (y < 900) art.style.transform = "translateY(" + y * 0.1 + "px)";
+    }, { passive: true });
+  }
+})();
