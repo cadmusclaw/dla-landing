@@ -48,30 +48,41 @@ if (host) {
   const group = new THREE.Group();
   scene.add(group);
 
-  /* rim */
-  const barrel = cast(new THREE.Mesh(new THREE.CylinderGeometry(1, 1, 0.56, 72, 1, true), steel));
-  barrel.rotation.x = Math.PI / 2;
-  group.add(barrel);
-  for (const z of [-0.29, 0.29]) {
-    const fl = cast(new THREE.Mesh(new THREE.TorusGeometry(1.03, 0.05, 20, 72), steel));
-    fl.position.z = z;
-    group.add(fl);
-  }
+  /* two-piece bolt-together military wheel */
+  const holeDark = new THREE.MeshStandardMaterial({ color: 0x05070c, roughness: 0.9 });
+  const inner = new THREE.Group();   /* rear half */
+  const outer = new THREE.Group();   /* front (disc) half — unbolts */
+  group.add(inner, outer);
+  const bF = cast(new THREE.Mesh(new THREE.CylinderGeometry(1, 1, 0.26, 72, 1, true), steel));
+  bF.rotation.x = Math.PI / 2; bF.position.z = 0.15; outer.add(bF);
+  const bR = cast(new THREE.Mesh(new THREE.CylinderGeometry(1, 1, 0.26, 72, 1, true), steel));
+  bR.rotation.x = Math.PI / 2; bR.position.z = -0.15; inner.add(bR);
+  const sF = cast(new THREE.Mesh(new THREE.TorusGeometry(1.045, 0.028, 12, 72), steel));
+  sF.position.z = 0.018; outer.add(sF);
+  const sR = cast(new THREE.Mesh(new THREE.TorusGeometry(1.045, 0.028, 12, 72), steel));
+  sR.position.z = -0.018; inner.add(sR);
+  const fF = cast(new THREE.Mesh(new THREE.TorusGeometry(1.03, 0.05, 20, 72), steel));
+  fF.position.z = 0.29; outer.add(fF);
+  const fR = cast(new THREE.Mesh(new THREE.TorusGeometry(1.03, 0.05, 20, 72), steel));
+  fR.position.z = -0.29; inner.add(fR);
   const disc = cast(new THREE.Mesh(new THREE.CylinderGeometry(0.985, 0.985, 0.07, 72), steelDark));
-  disc.rotation.x = Math.PI / 2;
-  disc.position.z = 0.12;
-  group.add(disc);
+  disc.rotation.x = Math.PI / 2; disc.position.z = 0.12; outer.add(disc);
   const hub = cast(new THREE.Mesh(new THREE.CylinderGeometry(0.24, 0.24, 0.12, 48), steel));
-  hub.rotation.x = Math.PI / 2;
-  hub.position.z = 0.14;
-  group.add(hub);
-  for (let i = 0; i < 8; i++) {
-    const a = i / 8 * Math.PI * 2;
-    const lug = cast(new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 0.08, 6), steel));
-    lug.rotation.x = Math.PI / 2;
-    lug.position.set(Math.cos(a) * 0.35, Math.sin(a) * 0.35, 0.18);
-    group.add(lug);
+  hub.rotation.x = Math.PI / 2; hub.position.z = 0.14; outer.add(hub);
+  for (let i = 0; i < 6; i++) {
+    const a = i / 6 * Math.PI * 2 + Math.PI / 6;
+    const hole = new THREE.Mesh(new THREE.CylinderGeometry(0.13, 0.13, 0.02, 24), holeDark);
+    hole.rotation.x = Math.PI / 2; hole.position.set(Math.cos(a) * 0.68, Math.sin(a) * 0.68, 0.156);
+    outer.add(hole);
   }
+  for (let i = 0; i < 12; i++) {
+    const a = i / 12 * Math.PI * 2;
+    const bolt = cast(new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.045, 0.09, 6), steel));
+    bolt.rotation.x = Math.PI / 2; bolt.position.set(Math.cos(a) * 0.47, Math.sin(a) * 0.47, 0.17);
+    outer.add(bolt);
+  }
+  const back = cast(new THREE.Mesh(new THREE.CylinderGeometry(0.985, 0.985, 0.06, 72), steelDark));
+  back.rotation.x = Math.PI / 2; back.position.z = -0.12; inner.add(back);
 
   /* blue 3-piece runflat */
   const HALF = 56 * Math.PI / 180;
@@ -81,10 +92,18 @@ if (host) {
   const segGeo = new THREE.ExtrudeGeometry(shape, { depth: 0.42, bevelEnabled: true, bevelThickness: 0.03, bevelSize: 0.03, bevelSegments: 3, curveSegments: 48 });
   segGeo.translate(0, 0, -0.21);
 
+  const blueDark = new THREE.MeshStandardMaterial({ color: 0x156e8c, metalness: 0.15, roughness: 0.5 });
   const segs = [-30, 90, 210].map(deg => {
     const mid = deg * Math.PI / 180;
     const m = cast(new THREE.Mesh(segGeo, blue));
     m.rotation.z = mid;
+    const groove = new THREE.Mesh(new THREE.TorusGeometry(1.37, 0.08, 12, 32, 2 * HALF), blueDark);
+    groove.rotation.z = -HALF; m.add(groove);
+    for (const a of [-0.55, 0.55]) {
+      const slot = new THREE.Mesh(new THREE.BoxGeometry(0.10, 0.30, 0.46), blueDark);
+      slot.position.set(Math.cos(a) * 1.42, Math.sin(a) * 1.42, 0);
+      slot.rotation.z = a; m.add(slot);
+    }
     group.add(m);
     return { mesh: m, mid };
   });
@@ -139,6 +158,7 @@ if (host) {
       s.mesh.position.set(Math.cos(s.mid) * off, Math.sin(s.mid) * off, 0);
     });
     bolts.forEach(b => { b.grp.position.z = explode * 1.1; });
+    outer.position.z = explode * 1.0;
     controls.update();
     renderer.render(scene, camera);
   });
