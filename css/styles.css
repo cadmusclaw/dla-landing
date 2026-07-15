@@ -995,3 +995,6 @@ a.card:hover {
 }
 .product-body p { font-size: 0.95rem; }
 .product-body .btn { margin-top: 8px; align-self: flex-start; }
+
+/* ---------- Real logo mark ---------- */
+img.brand-mark { object-fit: contain; border-radius: 4px; background: transparent; }
