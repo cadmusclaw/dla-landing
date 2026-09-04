@@ -12,6 +12,7 @@
 
 import { makeConfig } from './config.mjs';
 import { StubHaversineDistanceProvider, corridorProjection } from './geo.mjs';
+import { computeRunPay, potentialPayUsd } from './pay.mjs';
 import {
   UNASSIGNED_REASONS,
   WARNINGS,
@@ -186,26 +187,26 @@ function growRun({ anchor, pool, yard, provider, config, startMinutes }) {
 /**
  * Pick the best run available to one open slot.
  *
- * Anchors are the N farthest open orders: anchoring on the far end is what
- * produces "driver heads up the Turnpike and collects stops along the path"
- * instead of a cluster of cherry-picked short hops that strands the outliers.
+ * Anchors are the farthest open orders, walking inward until enough FEASIBLE
+ * candidates exist (late in the day the far ones can be unreachable before the
+ * 2000 hard stop). Each candidate grows greedily inside its own corridor, so
+ * every option on the table is already geographically sound - this only
+ * chooses between them.
  *
- * Candidate corridors are ranked:
- *   1. most stops        - a fuller truck is a better use of a scarce run slot
- *   2. farthest anchor   - the far outlier is the hardest stop to place later;
- *                          close-in stops fit into almost any later corridor
- *   3. lowest cost/stop  - tightest corridor of the remaining options
- * and then, only between options that are otherwise similar (same stop count,
- * cost within tieBreakTolerancePct), the soft weight-mix preference breaks the
- * tie. Geography is never overridden by weight mix (Rule 5).
+ * Default objective is 'revenue_per_hour': what the run pays under the rate
+ * card, divided by the scored hours it burns (drive + service + the state
+ * switching penalty). Because the rate card pays by the load AND by mileage,
+ * two long drops in the $2/mile band can out-earn a full four-stop local milk
+ * run - this ranking picks that up instead of blindly filling the truck.
+ * Set selectionObjective: 'stops_first' to go back to fill-the-truck ordering.
+ *
+ * The soft weight-mix preference breaks ties only between options already
+ * within tieBreakTolerancePct of each other - it never overrides geography.
  */
 function selectBestRun({ pool, yard, provider, config, startMinutes }) {
   const deliverable = pool.filter((o) => !o.isStickBuild);
   if (deliverable.length === 0) return null;
 
-  // Farthest first, but keep walking inward until we have enough FEASIBLE
-  // candidates: late in the day the far anchors can be unreachable inside the
-  // 2000 hard stop, and settling for a thin run then wastes a whole slot.
   const anchors = [...deliverable].sort(
     (a, b) => provider.distanceMiles(yard, b) - provider.distanceMiles(yard, a),
   );
@@ -216,30 +217,80 @@ function selectBestRun({ pool, yard, provider, config, startMinutes }) {
     if (scored.length >= wanted) break;
     const run = growRun({ anchor, pool: deliverable, yard, provider, config, startMinutes });
     if (!run) continue;
+    const ev = run.evaluation;
+    const pay = computeRunPay({ sequence: ev.sequence, yard, provider, config });
+    // Scored hours, not clock hours: the state switching penalty makes a
+    // multi-state route look less profitable without faking the finish time.
+    const scoredHours = (ev.totalCostMinutes + ev.serviceMinutes) / 60;
     scored.push({
       run,
-      costPerStop: run.evaluation.totalCostMinutes / run.stops.length,
+      payUsd: pay.totalPayUsd,
+      usdPerHour: pay.totalPayUsd / scoredHours,
+      costPerStop: ev.totalCostMinutes / run.stops.length,
       anchorMiles: provider.distanceMiles(yard, anchor),
     });
   }
   if (scored.length === 0) return null;
 
-  scored.sort(
-    (a, b) =>
-      b.run.stops.length - a.run.stops.length ||
-      b.anchorMiles - a.anchorMiles ||
-      a.costPerStop - b.costPerStop,
-  );
+  const objective = config.selectionObjective;
+  const revenueMode = objective !== 'stops_first';
+  if (objective === 'revenue_per_run') {
+    scored.sort(
+      (a, b) =>
+        b.payUsd - a.payUsd ||
+        b.usdPerHour - a.usdPerHour ||
+        b.run.stops.length - a.run.stops.length,
+    );
+  } else if (objective === 'revenue_per_hour') {
+    scored.sort(
+      (a, b) =>
+        b.usdPerHour - a.usdPerHour ||
+        b.payUsd - a.payUsd ||
+        b.anchorMiles - a.anchorMiles,
+    );
+  } else {
+    scored.sort(
+      (a, b) =>
+        b.run.stops.length - a.run.stops.length ||
+        b.anchorMiles - a.anchorMiles ||
+        a.costPerStop - b.costPerStop,
+    );
+  }
+
+  const scoreOf = (s) => {
+    if (objective === 'revenue_per_run') return s.payUsd;
+    if (objective === 'revenue_per_hour') return s.usdPerHour;
+    return -s.costPerStop;
+  };
+  const near = (s, best) =>
+    Math.abs(scoreOf(best)) === 0
+      ? true
+      : (scoreOf(best) - scoreOf(s)) / Math.abs(scoreOf(best)) <= config.tieBreakTolerancePct;
 
   let best = scored[0];
+  let selectionNote = revenueMode
+    ? `Best of ${scored.length} candidate corridor(s) by ${objective}: ` +
+      `$${Math.round(best.payUsd).toLocaleString()} for ${best.run.stops.length} load(s), ` +
+      `$${Math.round(best.usdPerHour)}/hr`
+    : `Fullest sound corridor of ${scored.length} candidate(s): ${best.run.stops.length} stop(s)`;
+
+  // Within the tolerance band, a fuller truck is the better operational
+  // choice - same money, more orders cleared off the board.
+  const fuller = scored.find(
+    (s) => near(s, best) && s.run.stops.length > best.run.stops.length,
+  );
+  if (fuller) {
+    best = fuller;
+    selectionNote += `; tied on rate, took the fuller run (${fuller.run.stops.length} loads)`;
+  }
+
   let anchorTieBreakUsed = false;
   if (!best.run.evaluation.weightMixOk) {
-    const tolerance = best.costPerStop * (1 + config.tieBreakTolerancePct);
     const balanced = scored.find(
       (s) =>
         s.run.evaluation.weightMixOk &&
         s.run.stops.length === best.run.stops.length &&
-        s.costPerStop <= tolerance,
+        near(s, best),
     );
     if (balanced) {
       best = balanced;
@@ -247,7 +298,13 @@ function selectBestRun({ pool, yard, provider, config, startMinutes }) {
     }
   }
 
-  return { ...best.run, costPerStop: best.costPerStop, anchorTieBreakUsed };
+  return {
+    ...best.run,
+    costPerStop: best.costPerStop,
+    usdPerHour: best.usdPerHour,
+    selectionNote,
+    anchorTieBreakUsed,
+  };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -262,8 +319,10 @@ function runStartMinutes(driverState, tier, config) {
   return driverState.lastSequentialFinishMinutes + config.reloadOverheadMinutes;
 }
 
-function makeRunRecord({ driverState, pass, built, config, runSeq }) {
+function makeRunRecord({ driverState, pass, built, config, runSeq, yard, provider }) {
   const ev = built.evaluation;
+  const pay = computeRunPay({ sequence: ev.sequence, yard, provider, config });
+  const payByOrderId = new Map(pay.stops.map((s) => [s.orderId, s]));
   const flags = [];
   if (!ev.weightMixOk) flags.push(WARNINGS.WEIGHT_MIX_EXCEEDED);
   if (ev.crossesSoftStop) flags.push(WARNINGS.SOFT_STOP_CROSSED);
@@ -294,6 +353,9 @@ function makeRunRecord({ driverState, pass, built, config, runSeq }) {
       weightLbs: order.weightLbs,
       productType: order.productType,
       meta: built.stopMeta.get(order.id),
+      billableMiles: payByOrderId.get(order.id).billableMiles,
+      payUsd: payByOrderId.get(order.id).payUsd,
+      payBand: payByOrderId.get(order.id).payBand,
     })),
     stopCount: ev.sequence.length,
     totalWeightLbs: ev.totalWeightLbs,
@@ -305,6 +367,12 @@ function makeRunRecord({ driverState, pass, built, config, runSeq }) {
     totalCostMinutes: ev.totalCostMinutes,
     startMinutes: ev.startMinutes,
     finishMinutes: ev.finishMinutes,
+    totalPayUsd: pay.totalPayUsd,
+    payPerStopUsd: pay.totalPayUsd / ev.sequence.length,
+    usdPerScoredHour:
+      pay.totalPayUsd / ((ev.totalCostMinutes + ev.serviceMinutes) / 60),
+    selectionNote: built.selectionNote || null,
+    payMileageBasis: pay.mileageBasis,
     startClock: minutesToClock(ev.startMinutes),
     finishClock: minutesToClock(ev.finishMinutes),
     flags,
@@ -336,6 +404,10 @@ function traceForStop({ order, run, stop, built, config }) {
   }
 
   reasons.push(
+    `Pay: $${stop.payUsd.toLocaleString()} for this load ` +
+      `(${stop.billableMiles} billable mi, ${stop.payBand}); run pays $${run.totalPayUsd.toLocaleString()}`,
+  );
+  reasons.push(
     `Weight: run total ${run.totalWeightLbs.toLocaleString()} lbs of ` +
       `${config.maxRunWeightLbs.toLocaleString()} lb cap, ${run.stopCount}/${config.maxStopsPerRun} stops`,
   );
@@ -350,6 +422,9 @@ function traceForStop({ order, run, stop, built, config }) {
         `${run.switchingCostMinutes} min added to route cost (${run.driveMinutes.toFixed(0)} min drive -> ` +
         `${run.totalCostMinutes.toFixed(0)} min scored) - allowed because the loop still scored best`,
     );
+  }
+  if (run.selectionNote) {
+    reasons.push(`Run selection: ${run.selectionNote}`);
   }
   if (built?.weightMixTieBreakUsed) {
     reasons.push('Weight-mix tiebreaker applied while filling this run');
@@ -499,6 +574,8 @@ export function planDay({
         built,
         config,
         runSeq: driverState.runs.length + 1,
+        yard,
+        provider,
       });
       runs.push(run);
       driverState.runs.push(run);
@@ -535,6 +612,7 @@ export function planDay({
   }
 
   for (const item of unassigned) {
+    item.potential = potentialPayUsd({ order: item.order, yard, provider, config });
     traces.push({
       orderId: item.order.id,
       customer: item.order.customer,
@@ -567,6 +645,7 @@ export function planDay({
       baseRunsPerDay: d.capacity.baseRunsPerDay,
       extraRunsPerDay: d.capacity.extraRunsPerDay,
       runsAssigned: d.runs.length,
+      payUsd: d.runs.reduce((sum, r) => sum + r.totalPayUsd, 0),
       dayBlocked: d.dayBlocked,
       notes: d.notes,
     })),
@@ -578,8 +657,24 @@ export function planDay({
       state: u.order.address.state,
       weightLbs: u.order.weightLbs,
       reason: u.reason,
+      forgonePayUsd: u.potential ? u.potential.payUsd : 0,
     })),
     warnings: dayWarnings,
+    pay: {
+      mileageBasis: config.payment.mileageBasis,
+      loadsDelivered: runs.reduce((n, r) => n + r.stopCount, 0),
+      totalUsd: runs.reduce((sum, r) => sum + r.totalPayUsd, 0),
+      byDriver: driverStates.map((d) => ({
+        driverId: d.driver.id,
+        driverName: d.driver.name,
+        loads: d.runs.reduce((n, r) => n + r.stopCount, 0),
+        payUsd: d.runs.reduce((sum, r) => sum + r.totalPayUsd, 0),
+      })),
+      forgoneUsd: unassigned.reduce(
+        (sum, u) => sum + (u.potential ? u.potential.payUsd : 0),
+        0,
+      ),
+    },
   };
 }
 

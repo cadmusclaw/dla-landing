@@ -44,6 +44,9 @@ export const PLACES = {
   Media:          { city: 'Media',           state: 'PA', lat: 39.9168, lon: -75.3877 },
   KingOfPrussia:  { city: 'King of Prussia', state: 'PA', lat: 40.0893, lon: -75.3960 },
   Wilmington:     { city: 'Wilmington',      state: 'DE', lat: 39.7459, lon: -75.5466 },
+  Baltimore:      { city: 'Baltimore',       state: 'MD', lat: 39.2904, lon: -76.6122 },
+  Richmond:       { city: 'Richmond',        state: 'VA', lat: 37.5407, lon: -77.4360 },
+  Chesterfield:   { city: 'Chesterfield',    state: 'VA', lat: 37.3771, lon: -77.5047 },
 };
 
 let seq = 0;
@@ -242,4 +245,32 @@ export function scenarioF() {
   };
 }
 
-export const SCENARIOS = [scenarioA, scenarioB, scenarioC, scenarioD, scenarioE, scenarioF];
+/* ---------------------------------------------------------------------- */
+/* Scenario G - the far two-load day: fewer stops, better money            */
+/* ---------------------------------------------------------------------- */
+export function scenarioG() {
+  seq = 0;
+  return {
+    name: 'G. Long-haul two-load run vs. a full local milk run - pay decides',
+    date: '2026-09-09',
+    yard: YARD,
+    drivers: [DRIVERS.alfredo],
+    // Highway average for a genuine long haul; the local-only scenarios use
+    // the slower default.
+    config: { averageSpeedMph: 55 },
+    orders: [
+      // Two Richmond-area drops, both deep in the $2/mile band.
+      order('Richmond', 'Whitfield', 2300, 'shed'),
+      order('Chesterfield', 'Ramsey', 1900, 'shed'),
+      // A tidy local cluster that fills a truck but pays flat-rate money.
+      order('Glassboro', 'Petrov', 1200, 'playset'),
+      order('Sewell', 'Donnelly', 900, 'gazebo'),
+      order('Deptford', 'Amara', 2400, 'shed'),
+      order('CherryHill', 'Sunderland', 1700, 'shed'),
+      order('MountLaurel', 'Kavanagh', 1500, 'shed'),
+      order('Marlton', 'Trujillo', 1100, 'playset'),
+    ],
+  };
+}
+
+export const SCENARIOS = [scenarioA, scenarioB, scenarioC, scenarioD, scenarioE, scenarioF, scenarioG];

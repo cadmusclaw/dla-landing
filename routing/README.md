@@ -27,6 +27,7 @@ non-zero if any check fails, so it doubles as a regression test.
 | File | What it is |
 | --- | --- |
 | `config.mjs` | Every tunable constant. Nothing is hardcoded in the engine. |
+| `pay.mjs` | Rate card: pay per load by mileage band, per-run and forgone-revenue rollups. |
 | `geo.mjs` | `DistanceProvider` interface + haversine **stub**, corridor projection math. |
 | `model.mjs` | Order/driver normalisation, seniority order, capacity resolution (weekend hook), allocation pass plan. |
 | `router.mjs` | The engine: `planDay()`, run construction, scoring, Gate 5 handoff. |
@@ -112,16 +113,71 @@ which case `reloadOverheadMinutes` applies.
 also appear in the trace with status `unassigned`. Nothing is ever silently
 dropped — the demo asserts `assigned + unassigned == total` in every scenario.
 
+## Pay model
+
+Paid **by the load and by mileage**:
+
+| Billable miles | Pay per load |
+| --- | --- |
+| 0–50 | $150 |
+| 51–100 | $175 |
+| 101–150 | $225 |
+| 151–200 | $275 |
+| 201+ | $2.00 / mile |
+
+Two things worth knowing about that card as implemented:
+
+- The last band is a **step up, not a continuation**: 200 mi pays $275, 201 mi
+  pays $402. That is what the card says, so that is what the code does — flag
+  it if it was meant to be a floor rather than a jump.
+- **ASSUMPTION:** billable mileage is the **one-way yard → delivery address**
+  distance per load, rounded to whole miles. Set
+  `payment.mileageBasis: 'route_leg'` to bill the leg actually driven to reach
+  each stop instead. Worth confirming which one the rate card means, since a
+  four-stop cluster bills very differently under the two.
+
+Every run reports total pay, pay per load and dollars per scored hour; every
+driver and the day get a rollup; and unassigned orders report the revenue left
+on the table, so an overflow day shows its cost in dollars, not just in
+stop counts.
+
+## Which run wins a slot: `selectionObjective`
+
+A truck-day slot is usually the scarce resource, not the hour — so **a far
+two-load drop can be a better day than a full four-stop local milk run**.
+Scenario G is exactly that case:
+
+```
+revenue_per_run    run 1 = 2 loads to Chesterfield/Richmond -> $964 ($85/hr, ends 1832)
+                   day total $1,564,  $300 left on the table
+revenue_per_hour   run 1 = 4 local loads                    -> $600 ($132/hr, ends 1232)
+                   day total   $900,  $964 left on the table
+```
+
+The local run is worth 55% more per hour and still the wrong call here: taking
+it first strands the Richmond pair entirely and costs the day $664.
+
+- `revenue_per_run` **(default)** — most dollars for the slot; ties broken by
+  $/hr, then by stop count.
+- `revenue_per_hour` — most dollars per scored hour. Right when *hours* are the
+  binding constraint: a light board with drivers who can turn more runs.
+- `stops_first` — the old fill-the-truck ordering; ignores the rate card.
+
+This only chooses **between corridors that are already geographically sound** —
+the corridor rules still decide which stops may share a run, the hard caps
+still bind, and weight-mix is still only a tiebreaker. Revenue never buys a
+route a way around a rule.
+
 ## Run selection, in one paragraph
 
-For each open slot: build a candidate run from each of the farthest open
-orders as anchor (walking inward until enough *feasible* candidates exist, since
-late in the day the far anchors can be unreachable before 2000). Each candidate
-grows greedily by lowest marginal cost within its corridor, subject to the hard
-caps. Candidates are ranked by **most stops → farthest anchor → lowest cost per
-stop**; the weight-mix preference breaks ties only between otherwise-similar
-options. Drop order within a run is solved exactly — at most 4 stops means at
-most 24 orderings.
+For each open slot: build a candidate run from each of the farthest open orders
+as anchor (walking inward until enough *feasible* candidates exist, since late
+in the day the far anchors can be unreachable before 2000). Each candidate grows
+greedily by lowest marginal cost within its corridor, subject to the hard caps.
+Candidates are then ranked by `selectionObjective` (default: most dollars for
+the slot); between options within `tieBreakTolerancePct` of each other, a fuller
+truck wins, and then the weight-mix preference breaks the tie. Drop order within
+a run is solved exactly — at most 4 stops means at most 24 orderings.
 
 ## Seams left open on purpose
 
@@ -145,5 +201,7 @@ most 24 orderings.
 - **1800 crossing** — warn vs. require approval is undecided; both are built
   behind `requireApprovalForSoftStopCrossing`.
 - **Reload overhead (60 min)** — assumed, needs confirming with ops.
+- **Billable mileage basis** — one-way yard-to-stop (assumed) vs. the leg
+  actually driven; and whether the 201+ band is meant to jump from $275 to $402.
 - **Stub travel times** — no river crossings, tolls or traffic; drop orders and
   costs will shift once a real routing API is plugged in.

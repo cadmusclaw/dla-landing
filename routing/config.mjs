@@ -62,8 +62,43 @@ export const DEFAULT_CONFIG = {
   // picking the best resulting run.
   seedCandidateCount: 3,
   // Two options are "otherwise similar" (and therefore decided by the soft
-  // weight-mix preference) when their costs are within this fraction.
+  // weight-mix preference) when their scores are within this fraction.
   tieBreakTolerancePct: 0.15,
+
+  // How candidate corridors compete for an open run slot:
+  //   'revenue_per_run'  - most dollars for this slot. The scarce resource is
+  //                        the truck-day, not the hour: a 2-load run to the
+  //                        $2/mile band can be a better day than a full 4-stop
+  //                        local milk run even though it pays less per hour.
+  //   'revenue_per_hour' - most dollars per scored hour. Use when hours, not
+  //                        slots, are the binding constraint (light order
+  //                        board, drivers with spare capacity).
+  //   'stops_first'      - fill the truck: most stops, then farthest anchor,
+  //                        then lowest cost per stop. Ignores the rate card.
+  // Either way the corridor rules decide WHICH stops may share a run - this
+  // only picks between corridors that are already geographically sound.
+  selectionObjective: 'revenue_per_run',
+
+  // --- Pay / revenue --------------------------------------------------------
+  // Paid by the load and by mileage. Flat rate per load inside each mileage
+  // band; past the last band it becomes a straight per-mile rate.
+  //   0-50 mi $150 | 51-100 $175 | 101-150 $225 | 151-200 $275 | 201+ $2/mile
+  // NOTE: the last band is a step up, not a continuation - 200 mi pays $275,
+  // 201 mi pays $402. That is what the rate card says; it is not a bug here.
+  payment: {
+    tiers: [
+      { maxMiles: 50, flatUsd: 150 },
+      { maxMiles: 100, flatUsd: 175 },
+      { maxMiles: 150, flatUsd: 225 },
+      { maxMiles: 200, flatUsd: 275 },
+    ],
+    overflowPerMileUsd: 2, // applies to every mile once past the last tier
+    // ASSUMPTION: billable mileage per load is yard -> delivery address
+    // (one way). Set 'route_leg' to bill the leg actually driven to reach the
+    // stop instead. Confirm which one the rate card means.
+    mileageBasis: 'yard_to_stop',
+    roundMilesToWhole: true,
+  },
 
   // --- Rule 9: driver capacity ---------------------------------------------
   // A driver's *extra* runs are a second truck running in parallel the same
@@ -88,5 +123,6 @@ export const DEFAULT_CONFIG = {
 export function makeConfig(overrides = {}) {
   const merged = { ...DEFAULT_CONFIG, ...overrides };
   merged.weekend = { ...DEFAULT_CONFIG.weekend, ...(overrides.weekend || {}) };
+  merged.payment = { ...DEFAULT_CONFIG.payment, ...(overrides.payment || {}) };
   return merged;
 }

@@ -1,6 +1,7 @@
 /** Human-readable rendering of a plan: per-order traces + per-run summary. */
 
 import { minutesToClock } from './model.mjs';
+import { usd } from './pay.mjs';
 
 const line = (char = '-', n = 78) => char.repeat(n);
 const lbs = (n) => `${Math.round(n).toLocaleString()} lbs`;
@@ -20,6 +21,12 @@ export function formatPlan(plan, { title = 'DELIVERY PLAN' } = {}) {
     `Caps: ${cfg.maxRunWeightLbs.toLocaleString()} lbs / ${cfg.maxStopsPerRun} stops per run   ` +
       `Depart ${minutesToClock(cfg.departureTimeMinutes)}   ` +
       `Soft stop ${minutesToClock(cfg.softStopMinutes)}   Hard stop ${minutesToClock(cfg.hardStopMinutes)}`,
+  );
+  out.push(
+    `Pay: ${cfg.payment.tiers
+      .map((t, i, all) => `${i === 0 ? 0 : all[i - 1].maxMiles + 1}-${t.maxMiles}mi ${usd(t.flatUsd)}`)
+      .join('  ')}  ${cfg.payment.tiers[cfg.payment.tiers.length - 1].maxMiles + 1}+mi ` +
+      `$${cfg.payment.overflowPerMileUsd}/mi   Selection: ${cfg.selectionObjective}`,
   );
   out.push(
     `Switching cost: ${cfg.stateSwitchingCostMinutes} min per extra state   ` +
@@ -78,13 +85,37 @@ export function formatPlan(plan, { title = 'DELIVERY PLAN' } = {}) {
           `heavy items ${run.heavyCount}`,
       );
       out.push(
+        `        pays ${usd(run.totalPayUsd)} (${usd(run.payPerStopUsd)}/load, ` +
+          `${usd(run.usdPerScoredHour)}/hr)`,
+      );
+      out.push(
         `        drop order: ${run.stops
-          .map((s) => `${s.sequence}) ${s.orderId} ${s.city},${s.state} ${lbs(s.weightLbs)}`)
+          .map(
+            (s) =>
+              `${s.sequence}) ${s.orderId} ${s.city},${s.state} ${lbs(s.weightLbs)} ` +
+              `${s.billableMiles}mi ${usd(s.payUsd)}`,
+          )
           .join('  ')}`,
       );
       out.push(`        flags: ${run.flags.length ? run.flags.join(', ') : 'none'}`);
     }
     for (const note of driver.notes) out.push(`    note: ${note}`);
+  }
+
+  out.push('');
+  out.push('DAY PAY');
+  out.push(line());
+  out.push(
+    `  ${plan.pay.loadsDelivered} load(s) delivered, ${usd(plan.pay.totalUsd)} total ` +
+      `(mileage basis: ${plan.pay.mileageBasis})`,
+  );
+  for (const d of plan.pay.byDriver) {
+    out.push(`    ${d.driverName}: ${d.loads} load(s), ${usd(d.payUsd)}`);
+  }
+  if (plan.pay.forgoneUsd > 0) {
+    out.push(
+      `  Left on the table: ${usd(plan.pay.forgoneUsd)} across ${plan.unassigned.length} unassigned load(s)`,
+    );
   }
 
   out.push('');
@@ -95,7 +126,8 @@ export function formatPlan(plan, { title = 'DELIVERY PLAN' } = {}) {
   } else {
     for (const u of plan.unassigned) {
       out.push(
-        `  ${u.orderId}  ${u.customer}  ${u.city}, ${u.state}  ${lbs(u.weightLbs)}  -  ${u.reason}`,
+        `  ${u.orderId}  ${u.customer}  ${u.city}, ${u.state}  ${lbs(u.weightLbs)}  ` +
+          `(would pay ${usd(u.forgonePayUsd)})  -  ${u.reason}`,
       );
     }
   }

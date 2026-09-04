@@ -150,6 +150,34 @@ const expectations = {
     );
   },
 
+  G(scenario, plan) {
+    const plans = objectiveComparison(scenario);
+    const perRun = plans.revenue_per_run.runs[0];
+    const perHour = plans.revenue_per_hour.runs[0];
+    check(
+      'Default objective takes the far two-load run for the scarce truck-day slot',
+      perRun.stopCount === 2 && perRun.stops.every((s) => s.state === 'VA'),
+      `${perRun.stopCount} loads, $${perRun.totalPayUsd} vs the local run's hourly rate`,
+    );
+    check(
+      'That far run really does pay more per slot than the full local milk run',
+      perRun.totalPayUsd > perHour.totalPayUsd,
+      `$${perRun.totalPayUsd} (2 long loads) vs $${perHour.totalPayUsd} (${perHour.stopCount} local loads)`,
+    );
+    check(
+      'revenue_per_hour still prefers the local run - the tradeoff is explicit, not hidden',
+      perHour.usdPerScoredHour > perRun.usdPerScoredHour,
+      `$${Math.round(perHour.usdPerScoredHour)}/hr local vs $${Math.round(perRun.usdPerScoredHour)}/hr long haul`,
+    );
+    check(
+      'Long-haul run is still bound by the time rules (flagged if it crosses 1800)',
+      perRun.finishMinutes <= plan.config.hardStopMinutes &&
+        (perRun.finishMinutes <= plan.config.softStopMinutes ||
+          perRun.flags.includes('SOFT_STOP_CROSSED')),
+      `ends ${perRun.finishClock}, flags: ${perRun.flags.join(', ') || 'none'}`,
+    );
+  },
+
   E(scenario, plan) {
     check(
       'Overflow is marked unassigned, never silently dropped',
@@ -168,6 +196,34 @@ const expectations = {
     );
   },
 };
+
+/** Scenario G also re-plans under a different objective to show the tradeoff. */
+function objectiveComparison(scenario) {
+  const variants = ['revenue_per_run', 'revenue_per_hour', 'stops_first'];
+  console.log('OBJECTIVE COMPARISON (same orders, same drivers)');
+  console.log('-'.repeat(78));
+  const plans = {};
+  for (const objective of variants) {
+    const plan = planDay({
+      yard: scenario.yard,
+      orders: scenario.orders,
+      drivers: scenario.drivers,
+      date: scenario.date,
+      config: { ...(scenario.config || {}), selectionObjective: objective },
+    });
+    plans[objective] = plan;
+    const first = plan.runs[0];
+    console.log(
+      `  ${objective.padEnd(18)} run 1 = ${first.stopCount} load(s) to ` +
+        `${first.stops.map((s) => s.city).join('/')} -> $${first.totalPayUsd.toLocaleString()} ` +
+        `($${Math.round(first.usdPerScoredHour)}/hr, ends ${first.finishClock})  |  ` +
+        `day total $${plan.pay.totalUsd.toLocaleString()}, ` +
+        `$${plan.pay.forgoneUsd.toLocaleString()} left on the table`,
+    );
+  }
+  console.log('');
+  return plans;
+}
 
 const only = (process.argv[2] || '').toUpperCase();
 
